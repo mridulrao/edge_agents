@@ -80,101 +80,32 @@ def build_prompt(
     config: GenerationConfig
 ) -> str:
     """
-    Build the few-shot prompt for question generation.
+    Build a simplified prompt for question generation.
     
-    This prompt supports multiple question types and styles based on config:
-    - Question types: procedural, conceptual, temporal, comparative, etc.
-    - Question styles: interrogative, imperative, contextual
-    - Flexible question words: how, what, when, which, why, where
-    - Evidence grounding in chunk text
+    Only generates questions - no metadata like type, style, or evidence.
+    This makes it much more reliable for small models.
     
     Args:
         chunk_text: Text chunk to generate questions from
         num_questions: Number of questions to generate
-        config: Generation configuration with preferences
+        config: Generation configuration (mostly ignored for simplicity)
     """
-    # Build question type guidance
-    type_examples = []
-    if QuestionType.PROCEDURAL in config.question_types:
-        type_examples.append('- Procedural: "How do I enable conversion tracking?"')
-    if QuestionType.CONCEPTUAL in config.question_types:
-        type_examples.append('- Conceptual: "What is conversion tracking?"')
-    if QuestionType.TEMPORAL in config.question_types:
-        type_examples.append('- Temporal: "When should I use conversion tracking?"')
-    if QuestionType.COMPARATIVE in config.question_types:
-        type_examples.append('- Comparative: "Which conversion type should I choose?"')
-    if QuestionType.DIAGNOSTIC in config.question_types:
-        type_examples.append('- Diagnostic: "What causes conversion tracking failures?"')
-    if QuestionType.DEFINITIONAL in config.question_types:
-        type_examples.append('- Definitional: "What does CPA mean in this context?"')
     
-    type_guidance = "\n".join(type_examples) if type_examples else "- Generate questions of any relevant type"
-    
-    # Build style guidance
-    style_examples = []
-    if QuestionStyle.INTERROGATIVE in config.question_styles:
-        style_examples.append(f'- Start with: {", ".join(config.preferred_question_words)}')
-    if QuestionStyle.IMPERATIVE in config.question_styles:
-        style_examples.append('- Imperative form: "Explain how to...", "Describe the process..."')
-    if QuestionStyle.CONTEXTUAL in config.question_styles:
-        style_examples.append('- Contextual: "Steps to configure X", "Process for setting up Y"')
-    
-    style_guidance = "\n".join(style_examples) if style_examples else "- Use standard question format"
-    
-    # Build allowed question words list
-    question_words = ", ".join(f'"{w}"' for w in config.preferred_question_words)
-    
-    return f"""Given this article chunk from a knowledge base, generate diverse questions that can be answered from this chunk.
+    return f"""Based on this text, generate {num_questions} questions that can be answered from the content.
 
-Question Types to Generate:
-{type_guidance}
-
-Question Styles:
-{style_guidance}
-
-Requirements:
-- Generate questions answerable from this chunk only
-- Vary question types and styles for diversity
-- Include evidence snippet from the chunk for each question
-- Each question should be clear, specific, and useful for knowledge retrieval
-{f"- Prefer starting with: {question_words}" if config.preferred_question_words else ""}
-{f"- Non-question formats allowed (e.g., 'Explain...', 'Steps to...')" if config.allow_non_question_format else "- All questions must be in interrogative form"}
-
-Example Output:
+Return ONLY a JSON object in this exact format (no other text):
 {{
   "questions": [
-    {{
-      "question": "How do I enable conversion tracking in the platform?",
-      "type": "procedural",
-      "style": "interrogative",
-      "evidence": "navigate to Tools > Conversions. Click the + button and select the conversion type"
-    }},
-    {{
-      "question": "What types of conversions can be tracked?",
-      "type": "conceptual",
-      "style": "interrogative",
-      "evidence": "You can track web conversions, app installs, or phone calls"
-    }},
-    {{
-      "question": "When should different conversion types be used?",
-      "type": "temporal",
-      "style": "interrogative",
-      "evidence": "Each type requires different setup steps"
-    }},
-    {{
-      "question": "Which conversion tracking method is best for mobile apps?",
-      "type": "comparative",
-      "style": "interrogative",
-      "evidence": "app installs or phone calls. Each type requires different setup steps"
-    }}
+    "How do I enable conversion tracking?",
+    "What types of conversions can be tracked?",
+    "When should I use conversion tracking?"
   ]
 }}
 
-Now generate {num_questions} diverse questions for this chunk:
+Text:
+{chunk_text}
 
-Chunk: {chunk_text}
-
-Return only valid JSON in the format above. Do not include any other text or markdown formatting."""
+Return only the JSON object with {num_questions} questions:"""
 
 
 # ============================================================================
@@ -186,7 +117,9 @@ def parse_model_response(
     chunk_id: int
 ) -> List[QuestionCandidate]:
     """
-    Parse model JSON response into QuestionCandidate objects.
+    Parse simplified model JSON response into QuestionCandidate objects.
+    
+    Expected format: {"questions": ["question1", "question2", ...]}
     
     Args:
         response_text: Raw model output
@@ -240,43 +173,54 @@ def parse_model_response(
             chunk_id=chunk_id
         )
     
-    # Parse each question
+    # Parse each question - now they're just strings
     candidates = []
-    for i, q_data in enumerate(data["questions"]):
+    for i, question in enumerate(data["questions"]):
         try:
-            # Validate required fields
-            if not isinstance(q_data, dict):
-                continue
-            
-            question = q_data.get("question", "").strip()
-            q_type = q_data.get("type", "procedural").strip()
-            q_style = q_data.get("style", "interrogative").strip()
-            evidence = q_data.get("evidence", "").strip()
-            
-            if not question or not evidence:
-                continue
-            
-            # Parse question type
-            try:
-                question_type = QuestionType(q_type)
-            except ValueError:
-                # Default to procedural if type is invalid
-                question_type = QuestionType.PROCEDURAL
-            
-            # Parse question style
-            try:
-                question_style = QuestionStyle(q_style)
-            except ValueError:
-                # Default to interrogative if style is invalid
-                question_style = QuestionStyle.INTERROGATIVE
-            
-            candidates.append(QuestionCandidate(
-                question=question,
-                type=question_type,
-                evidence=evidence,
-                chunk_id=chunk_id,
-                style=question_style
-            ))
+            # Handle both string format and dict format (for backward compatibility)
+            if isinstance(question, str):
+                question_text = question.strip()
+                if not question_text:
+                    continue
+                
+                # Default metadata
+                candidates.append(QuestionCandidate(
+                    question=question_text,
+                    type=QuestionType.PROCEDURAL,  # Default type
+                    evidence="",  # No evidence in simplified format
+                    chunk_id=chunk_id,
+                    style=QuestionStyle.INTERROGATIVE  # Default style
+                ))
+                
+            elif isinstance(question, dict):
+                # Legacy format support
+                question_text = question.get("question", "").strip()
+                q_type = question.get("type", "procedural").strip()
+                q_style = question.get("style", "interrogative").strip()
+                evidence = question.get("evidence", "").strip()
+                
+                if not question_text:
+                    continue
+                
+                # Parse question type
+                try:
+                    question_type = QuestionType(q_type)
+                except ValueError:
+                    question_type = QuestionType.PROCEDURAL
+                
+                # Parse question style
+                try:
+                    question_style = QuestionStyle(q_style)
+                except ValueError:
+                    question_style = QuestionStyle.INTERROGATIVE
+                
+                candidates.append(QuestionCandidate(
+                    question=question_text,
+                    type=question_type,
+                    evidence=evidence,
+                    chunk_id=chunk_id,
+                    style=question_style
+                ))
             
         except Exception:
             # Skip malformed questions
@@ -321,8 +265,6 @@ class MockAdapter(ModelAdapter):
         
         # Generate synthetic questions with variety
         candidates = []
-        words = chunk.text.split()[:50]  # First 50 words
-        evidence_snippet = ' '.join(words[:20])
         
         # Define question templates for different types and styles
         templates = [
@@ -343,7 +285,7 @@ class MockAdapter(ModelAdapter):
             candidates.append(QuestionCandidate(
                 question=template.format(chunk_id=chunk.chunk_id),
                 type=q_type,
-                evidence=evidence_snippet,
+                evidence="",  # No evidence in simplified format
                 chunk_id=chunk.chunk_id,
                 style=q_style
             ))

@@ -140,14 +140,20 @@ def validate_evidence(
     """
     Validate evidence grounding in source chunk.
     
+    For simplified format (no evidence), this always passes.
+    
     Checks:
-    - Evidence length > 10 characters
+    - Evidence length > 10 characters (skipped if empty)
     - Evidence exists in chunk (fuzzy match with threshold)
     
     Returns:
         (is_valid, rejection_reason)
     """
     evidence = candidate.evidence.strip()
+    
+    # Skip validation for simplified format (no evidence)
+    if not evidence:
+        return True, ""
     
     # Check length
     if len(evidence) < 10:
@@ -354,6 +360,8 @@ def score_evidence_specificity(evidence: str) -> float:
     """
     Score evidence based on specificity indicators.
     
+    For simplified format (no evidence), returns neutral score.
+    
     High scores for:
     - Numbers and quantities
     - UI elements (buttons, menus, etc.)
@@ -362,6 +370,10 @@ def score_evidence_specificity(evidence: str) -> float:
     
     Returns score in [0, 1]
     """
+    # No evidence in simplified format - return neutral score
+    if not evidence or not evidence.strip():
+        return 0.5
+    
     score = 0.0
     
     # Check for numbers
@@ -524,7 +536,7 @@ def select_final_questions(
     
     Strategy:
     1. Rank all valid candidates by composite score
-    2. Select top K ensuring â‰¥60% from different chunks
+    2. Select top K ensuring Ã¢â€°Â¥60% from different chunks
     3. If <K remain, relax diversity constraints
     4. Final fallback: return all valid questions (min 1, target 3-4)
     
