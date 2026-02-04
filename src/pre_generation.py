@@ -5,8 +5,8 @@ Deterministic chunking and candidate allocation
 
 import re
 from typing import List
-from pipeline_types import ArticleInput, Chunk
-from errors import ChunkingError
+from src.pipeline_types import ArticleInput, Chunk
+from src.errors import ChunkingError
 
 
 # ============================================================================

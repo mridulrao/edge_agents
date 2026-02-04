@@ -4,7 +4,7 @@ Custom exceptions for pipeline stages
 """
 
 from typing import Optional
-from pipeline_types import PipelineStage, InferenceErrorCause
+from src.pipeline_types import PipelineStage, InferenceErrorCause
 
 
 class PipelineError(Exception):

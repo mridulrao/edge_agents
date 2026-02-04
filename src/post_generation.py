@@ -7,7 +7,7 @@ import re
 from typing import List, Set, Tuple, Optional
 from difflib import SequenceMatcher
 
-from pipeline_types import (
+from src.pipeline_types import (
     QuestionCandidate,
     ValidationResult,
     RejectedCandidate,

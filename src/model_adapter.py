@@ -7,8 +7,8 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 import json
 
-from pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType
-from errors import ModelInferenceError, InferenceErrorCause
+from src.pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType, QuestionStyle
+from src.errors import ModelInferenceError, InferenceErrorCause
 
 
 # ============================================================================

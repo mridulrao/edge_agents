@@ -15,4 +15,4 @@ wheels/
 llama.cpp/
 
 # llama models
-models/
+models/models/*

@@ -8,7 +8,7 @@ import asyncio
 from typing import List, Optional
 import tracemalloc
 
-from pipeline_types import (
+from src.pipeline_types import (
     ArticleInput,
     Chunk,
     QuestionCandidate,
@@ -17,10 +17,10 @@ from pipeline_types import (
     PipelineMetrics,
     PipelineResult
 )
-from errors import PipelineError, PipelineStage, ValidationError, ModelInferenceError
-from model_adapter import ModelAdapter
-from pre_generation import chunk_article, allocate_candidates
-from post_generation import (
+from src.errors import PipelineError, PipelineStage, ValidationError, ModelInferenceError
+from src.model_adapter import ModelAdapter
+from src.pre_generation import chunk_article, allocate_candidates
+from src.post_generation import (
     validate_candidates,
     deduplicate_candidates,
     rank_candidates,
