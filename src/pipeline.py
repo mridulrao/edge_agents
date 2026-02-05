@@ -252,6 +252,8 @@ class QuestionGenerationPipeline:
         """
         Execute post-generation stage: validation, dedup, ranking, selection.
         
+        Simplified version: just checks count and returns questions.
+        
         Args:
             candidates: Raw candidates from generation
             chunks: Source chunks
@@ -261,10 +263,22 @@ class QuestionGenerationPipeline:
             Final selected questions
             
         Raises:
-            ValidationError: If no candidates pass validation
+            ValidationError: If no candidates were generated
         """
         try:
-            # Validate
+            # Check if we got any candidates
+            if not candidates:
+                raise ValidationError(
+                    message="No candidates generated",
+                    rejected_count=0,
+                    valid_count=0
+                )
+            
+            print(f"\n📊 Post-generation stats:")
+            print(f"   • Candidates generated: {len(candidates)}")
+            print(f"   • Requested questions: {k}")
+            
+            # Validate (simplified - just returns all)
             validation_result = validate_candidates(candidates, chunks)
             
             if not validation_result.valid:
@@ -274,21 +288,19 @@ class QuestionGenerationPipeline:
                     valid_count=0
                 )
             
-            # Deduplicate
+            print(f"   • Valid candidates: {len(validation_result.valid)}")
+            
+            # Deduplicate (simplified - no-op)
             deduplicated = deduplicate_candidates(validation_result.valid)
+            print(f"   • After deduplication: {len(deduplicated)}")
             
-            if not deduplicated:
-                raise ValidationError(
-                    message="All candidates removed during deduplication",
-                    rejected_count=len(validation_result.valid),
-                    valid_count=0
-                )
-            
-            # Rank
+            # Rank (simplified - neutral scores)
             ranked = rank_candidates(deduplicated, chunks)
             
-            # Select
+            # Select (simplified - take first k)
             final_questions = select_final_questions(ranked, k)
+            
+            print(f"   • Final questions selected: {len(final_questions)}")
             
             if not final_questions:
                 raise ValidationError(
@@ -296,6 +308,11 @@ class QuestionGenerationPipeline:
                     rejected_count=len(candidates),
                     valid_count=0
                 )
+            
+            # Show the questions
+            print(f"\n✅ Generated Questions:")
+            for i, q in enumerate(final_questions, 1):
+                print(f"   {i}. {q.question}")
             
             return final_questions
             

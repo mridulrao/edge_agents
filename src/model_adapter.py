@@ -4,7 +4,7 @@ Abstract interface for model inference with concrete implementations
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Union, Dict
 import json
 
 from src.pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType, QuestionStyle
@@ -71,41 +71,117 @@ class ModelAdapter(ABC):
 
 
 # ============================================================================
-# Prompt Template
+# Prompt Template with System/User Message Support
 # ============================================================================
+
+def build_system_prompt() -> str:
+    """
+    Build the system prompt that instructs the model on its role and behavior.
+    
+    Returns:
+        System prompt string
+    """
+    return """You are a question generation assistant. Generate clear questions from documentation text and return them as JSON."""
+
+
+def build_user_prompt(chunk_text: str, num_questions: int) -> str:
+    """
+    Build the user prompt with the specific task and content.
+    
+    Args:
+        chunk_text: Text chunk to generate questions from
+        num_questions: Number of questions to generate
+        
+    Returns:
+        User prompt string
+    """
+    return f"""Generate {num_questions} questions about this text. Return ONLY a JSON array containing exactly {num_questions} questions.
+
+        Example output format:
+        {{"questions": ["question1", "question2", ...]}}
+
+        Text:
+        {chunk_text}
+
+        JSON output:
+        """
+
 
 def build_prompt(
     chunk_text: str, 
     num_questions: int,
     config: GenerationConfig
-) -> str:
+) -> Union[str, List[Dict[str, str]]]:
     """
-    Build a simplified prompt for question generation.
+    Build prompt for question generation.
     
-    Only generates questions - no metadata like type, style, or evidence.
-    This makes it much more reliable for small models.
+    Returns either:
+    - A list of chat messages (for instruct models): [{"role": "system", ...}, {"role": "user", ...}]
+    - A plain string (for base models or fallback)
     
     Args:
         chunk_text: Text chunk to generate questions from
         num_questions: Number of questions to generate
-        config: Generation configuration (mostly ignored for simplicity)
+        config: Generation configuration
+        
+    Returns:
+        Chat messages list or plain string prompt
     """
+    system_prompt = build_system_prompt()
+    user_prompt = build_user_prompt(chunk_text, num_questions)
     
-    return f"""Based on this text, generate {num_questions} questions that can be answered from the content.
+    # Return as chat messages format (adapters can handle this)
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
 
-Return ONLY a JSON object in this exact format (no other text):
-{{
-  "questions": [
-    "How do I enable conversion tracking?",
-    "What types of conversions can be tracked?",
-    "When should I use conversion tracking?"
-  ]
-}}
 
-Text:
-{chunk_text}
-
-Return only the JSON object with {num_questions} questions:"""
+def format_chat_prompt(
+    messages: List[Dict[str, str]],
+    tokenizer = None
+) -> str:
+    """
+    Format chat messages into a string prompt.
+    
+    Tries to use tokenizer's chat template if available,
+    otherwise falls back to simple concatenation.
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        tokenizer: Optional tokenizer with apply_chat_template method
+        
+    Returns:
+        Formatted prompt string
+    """
+    # Try to use tokenizer's chat template
+    if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except Exception:
+            pass  # Fall back to manual formatting
+    
+    # Manual formatting fallback
+    formatted_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        
+        if role == "system":
+            formatted_parts.append(f"System: {content}")
+        elif role == "user":
+            formatted_parts.append(f"User: {content}")
+        elif role == "assistant":
+            formatted_parts.append(f"Assistant: {content}")
+    
+    # Add generation prompt
+    formatted_parts.append("Assistant:")
+    
+    return "\n\n".join(formatted_parts)
 
 
 # ============================================================================
@@ -143,6 +219,8 @@ def parse_model_response(
     
     # Parse JSON
     try:
+        print(f"Response Text: {response_text}")
+        # print(f"Cleaned Text: {cleaned}")
         data = json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise ModelInferenceError(
@@ -309,5 +387,8 @@ __all__ = [
     'ModelAdapter',
     'MockAdapter',
     'build_prompt',
+    'build_system_prompt',
+    'build_user_prompt',
+    'format_chat_prompt',
     'parse_model_response',
 ]

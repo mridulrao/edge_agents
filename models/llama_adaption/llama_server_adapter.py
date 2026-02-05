@@ -12,7 +12,7 @@ from src.model_adapter import ModelAdapter, parse_model_response, build_prompt
 from src.pipeline_types import Chunk, QuestionCandidate, GenerationConfig
 from src.errors import ModelInferenceError, InferenceErrorCause
 
-from llama_server_manager import LlamaServerManager, ServerConfig
+from models.llama_adaption.llama_server_manager import LlamaServerManager, ServerConfig
 
 
 class LlamaServerAdapter(ModelAdapter):

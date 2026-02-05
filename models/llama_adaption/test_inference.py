@@ -11,7 +11,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from llama_server_adapter import create_adapter_with_server
+from models.llama_adaption.llama_server_adapter import create_adapter_with_server
 from src.pipeline import QuestionGenerationPipeline
 from src.pipeline_types import ArticleInput, GenerationConfig
 
@@ -126,10 +126,6 @@ async def main():
         print(f"\n📝 Questions:\n")
         for i, q in enumerate(result.questions, 1):
             print(f"{i}. {q.question}")
-            print(f"   Type: {q.type}")
-            print(f"   Confidence: {q.confidence_score:.2f}")
-            print(f"   Source chunk: {q.source_chunk_id}")
-            print()
         
         print("=" * 60)
         print("✓ Test completed successfully!")

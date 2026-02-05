@@ -15,4 +15,7 @@ wheels/
 llama.cpp/
 
 # llama models
-models/models/*
+models/llama_adaption/bartowski_google_gemma-3-270m-it-GGUF/*
+
+# onnx models
+models/onnx_adaption/onnx_models/*
