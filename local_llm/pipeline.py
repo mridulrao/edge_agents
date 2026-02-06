@@ -1,6 +1,6 @@
 """
 Edge Question Generation Pipeline - Orchestration
-End-to-end pipeline with metrics and error handling
+End-to-end pipeline with parallel processing support
 """
 
 import time
@@ -17,7 +17,7 @@ from src.pipeline_types import (
     PipelineMetrics,
     PipelineResult
 )
-from src.errors import PipelineError, PipelineStage, ValidationError, ModelInferenceError
+from src.errors import PipelineError, PipelineStage, ValidationError
 from src.model_adapter import ModelAdapter
 from src.pre_generation import chunk_article, allocate_candidates
 from src.post_generation import (
@@ -32,13 +32,15 @@ class QuestionGenerationPipeline:
     """
     End-to-end pipeline orchestrator.
     
-    Handles pre-gen → gen → post-gen with error recovery and metrics.
+    Handles pre-gen → gen → post-gen with parallel processing support.
     """
     
     def __init__(
         self,
         adapter: ModelAdapter,
-        config: Optional[GenerationConfig] = None
+        config: Optional[GenerationConfig] = None,
+        parallel_processing: bool = False,
+        max_concurrent_chunks: int = 3
     ):
         """
         Initialize pipeline with model adapter and config.
@@ -46,15 +48,19 @@ class QuestionGenerationPipeline:
         Args:
             adapter: Model adapter for inference
             config: Generation configuration (uses defaults if not provided)
+            parallel_processing: Enable parallel chunk processing for speed
+            max_concurrent_chunks: Maximum concurrent chunk requests (if parallel=True)
         """
         self.adapter = adapter
         self.config = config or GenerationConfig()
+        self.parallel_processing = parallel_processing
+        self.max_concurrent_chunks = max_concurrent_chunks
     
     async def generate(self, article: ArticleInput) -> List[FinalQuestion]:
         """
         Generate questions from article.
         
-        Returns 3-4 procedural questions optimized for KB retrieval.
+        Returns N questions as requested in article.desired_questions.
         
         Args:
             article: Input article with text
@@ -63,7 +69,7 @@ class QuestionGenerationPipeline:
             List of final questions
             
         Raises:
-            PipelineError: If all candidates fail validation
+            PipelineError: If generation fails
         """
         result = await self.generate_with_metrics(article)
         return result.questions
@@ -158,19 +164,26 @@ class QuestionGenerationPipeline:
     
     def _pre_generation(self, article: ArticleInput) -> List[Chunk]:
         """
-        Execute pre-generation stage: chunking and planning.
+        Execute pre-generation stage: chunking with buffer strategy.
         
         Args:
             article: Input article
             
         Returns:
-            List of chunks
+            List of chunks (1.5x desired_questions for buffer)
             
         Raises:
             PipelineError: If chunking fails
         """
         try:
             chunks = chunk_article(article)
+            
+            # Log chunking info
+            print(f"\n📦 Chunking complete:")
+            print(f"   • Desired questions: {article.desired_questions}")
+            print(f"   • Chunks created: {len(chunks)} (1.5x buffer)")
+            print(f"   • Chunk size: ~200 words each")
+            
             return chunks
         except Exception as e:
             raise PipelineError(
@@ -187,6 +200,8 @@ class QuestionGenerationPipeline:
         """
         Execute generation stage: invoke model for each chunk.
         
+        Supports both sequential (memory-safe) and parallel (faster) processing.
+        
         Args:
             chunks: Prepared chunks
             desired_questions: Target number of questions
@@ -197,7 +212,7 @@ class QuestionGenerationPipeline:
         Raises:
             PipelineError: If generation fails for all chunks
         """
-        # Calculate candidate allocation
+        # Calculate candidate allocation (always 1 per chunk)
         allocations = allocate_candidates(len(chunks), desired_questions)
         
         # Check model readiness
@@ -208,12 +223,47 @@ class QuestionGenerationPipeline:
                 recoverable=True
             )
         
-        # Process chunks in parallel (or sequentially for controlled memory)
+        # Choose processing mode
+        if self.parallel_processing:
+            print(f"\n⚡ Parallel processing (max {self.max_concurrent_chunks} concurrent)")
+            all_candidates, chunk_times, errors = await self._process_chunks_parallel(
+                chunks, allocations
+            )
+        else:
+            print(f"\n🔄 Sequential processing")
+            all_candidates, chunk_times, errors = await self._process_chunks_sequential(
+                chunks, allocations
+            )
+        
+        # Check if we got any candidates
+        if not all_candidates:
+            raise PipelineError(
+                message=f"Generation failed for all chunks. Errors: {errors}",
+                stage=PipelineStage.GENERATION,
+                recoverable=False
+            )
+        
+        print(f"   • Generated {len(all_candidates)} candidate questions")
+        if errors:
+            print(f"   ⚠️  {len(errors)} chunks failed")
+        
+        return all_candidates, chunk_times
+    
+    async def _process_chunks_sequential(
+        self,
+        chunks: List[Chunk],
+        allocations: List[int]
+    ) -> tuple[List[QuestionCandidate], List[float], List[Exception]]:
+        """
+        Process chunks sequentially (memory-safe, default).
+        
+        Returns:
+            Tuple of (candidates, times, errors)
+        """
         all_candidates: List[QuestionCandidate] = []
         chunk_times: List[float] = []
         errors: List[Exception] = []
         
-        # Process chunks sequentially to control memory usage
         for chunk, num_candidates in zip(chunks, allocations):
             chunk_start = time.perf_counter()
             
@@ -233,15 +283,73 @@ class QuestionGenerationPipeline:
                 chunk_end = time.perf_counter()
                 chunk_times.append((chunk_end - chunk_start) * 1000)
         
-        # Check if we got any candidates
-        if not all_candidates:
-            raise PipelineError(
-                message=f"Generation failed for all chunks. Errors: {errors}",
-                stage=PipelineStage.GENERATION,
-                recoverable=False
-            )
+        return all_candidates, chunk_times, errors
+    
+    async def _process_chunks_parallel(
+        self,
+        chunks: List[Chunk],
+        allocations: List[int]
+    ) -> tuple[List[QuestionCandidate], List[float], List[Exception]]:
+        """
+        Process chunks in parallel with concurrency control.
         
-        return all_candidates, chunk_times
+        Uses semaphore to limit concurrent requests.
+        
+        Returns:
+            Tuple of (candidates, times, errors)
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent_chunks)
+        
+        async def process_chunk_with_semaphore(
+            chunk: Chunk,
+            num_candidates: int,
+            chunk_idx: int
+        ) -> tuple[int, List[QuestionCandidate], float, Optional[Exception]]:
+            """Process a single chunk with semaphore for concurrency control"""
+            async with semaphore:
+                chunk_start = time.perf_counter()
+                
+                try:
+                    candidates = await self.adapter.generate_questions(
+                        chunk=chunk,
+                        num_candidates=num_candidates,
+                        generation_config=self.config
+                    )
+                    chunk_end = time.perf_counter()
+                    elapsed_ms = (chunk_end - chunk_start) * 1000
+                    return chunk_idx, candidates, elapsed_ms, None
+                
+                except Exception as e:
+                    chunk_end = time.perf_counter()
+                    elapsed_ms = (chunk_end - chunk_start) * 1000
+                    return chunk_idx, [], elapsed_ms, e
+        
+        # Create tasks for all chunks
+        tasks = [
+            process_chunk_with_semaphore(chunk, num_candidates, idx)
+            for idx, (chunk, num_candidates) in enumerate(zip(chunks, allocations))
+        ]
+        
+        # Execute in parallel with gather
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        
+        # Sort results by chunk index to maintain order
+        results.sort(key=lambda x: x[0])
+        
+        # Extract candidates, times, and errors
+        all_candidates: List[QuestionCandidate] = []
+        chunk_times: List[float] = []
+        errors: List[Exception] = []
+        
+        for chunk_idx, candidates, elapsed_ms, error in results:
+            chunk_times.append(elapsed_ms)
+            
+            if error:
+                errors.append(error)
+            else:
+                all_candidates.extend(candidates)
+        
+        return all_candidates, chunk_times, errors
     
     def _post_generation(
         self,
@@ -250,9 +358,7 @@ class QuestionGenerationPipeline:
         k: int
     ) -> List[FinalQuestion]:
         """
-        Execute post-generation stage: validation, dedup, ranking, selection.
-        
-        Simplified version: just checks count and returns questions.
+        Execute post-generation stage: minimal validation, take top K.
         
         Args:
             candidates: Raw candidates from generation
@@ -263,22 +369,14 @@ class QuestionGenerationPipeline:
             Final selected questions
             
         Raises:
-            ValidationError: If no candidates were generated
+            ValidationError: If not enough valid candidates
         """
         try:
-            # Check if we got any candidates
-            if not candidates:
-                raise ValidationError(
-                    message="No candidates generated",
-                    rejected_count=0,
-                    valid_count=0
-                )
-            
-            print(f"\n📊 Post-generation stats:")
+            print(f"\n🔍 Post-processing:")
             print(f"   • Candidates generated: {len(candidates)}")
             print(f"   • Requested questions: {k}")
             
-            # Validate (simplified - just returns all)
+            # Minimal validation (no evidence checking)
             validation_result = validate_candidates(candidates, chunks)
             
             if not validation_result.valid:
@@ -290,29 +388,19 @@ class QuestionGenerationPipeline:
             
             print(f"   • Valid candidates: {len(validation_result.valid)}")
             
-            # Deduplicate (simplified - no-op)
+            # No deduplication
             deduplicated = deduplicate_candidates(validation_result.valid)
-            print(f"   • After deduplication: {len(deduplicated)}")
             
-            # Rank (simplified - neutral scores)
+            # Neutral ranking
             ranked = rank_candidates(deduplicated, chunks)
             
-            # Select (simplified - take first k)
+            # Select top K
             final_questions = select_final_questions(ranked, k)
             
-            print(f"   • Final questions selected: {len(final_questions)}")
+            print(f"   • Final questions: {len(final_questions)}")
             
-            if not final_questions:
-                raise ValidationError(
-                    message="Selection produced no questions",
-                    rejected_count=len(candidates),
-                    valid_count=0
-                )
-            
-            # Show the questions
-            print(f"\n✅ Generated Questions:")
-            for i, q in enumerate(final_questions, 1):
-                print(f"   {i}. {q.question}")
+            if len(final_questions) < k:
+                print(f"   ⚠️  Got {len(final_questions)} questions, wanted {k}")
             
             return final_questions
             

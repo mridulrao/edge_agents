@@ -19,3 +19,7 @@ models/llama_adaption/bartowski_google_gemma-3-270m-it-GGUF/*
 
 # onnx models
 models/onnx_adaption/onnx_models/*
+
+# webllm models 
+web_llm/onnx_adaption_web/smollm2_onnx/*
+web_llm/onnx_adaption_web/smollm2_onnx_fp32/*

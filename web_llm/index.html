@@ -1,0 +1,470 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Edge Question Generation Pipeline - WebGPU</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { 
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; 
+        max-width: 1000px; 
+        margin: 24px auto; 
+        padding: 0 16px; 
+      }
+      h2 { color: #333; }
+      .section { 
+        margin: 24px 0; 
+        padding: 16px; 
+        background: #f9f9f9; 
+        border-radius: 8px; 
+      }
+      .section h3 { 
+        margin-top: 0; 
+        color: #555; 
+      }
+      textarea { 
+        width: 100%; 
+        min-height: 120px; 
+        font-size: 14px; 
+        padding: 10px; 
+        font-family: monospace; 
+        border: 1px solid #ddd;
+        border-radius: 4px;
+      }
+      button { 
+        padding: 10px 20px; 
+        font-size: 14px; 
+        cursor: pointer; 
+        background: #0066cc;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        margin-right: 8px;
+      }
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      button:hover:not(:disabled) {
+        background: #0052a3;
+      }
+      pre { 
+        white-space: pre-wrap; 
+        background: #fff; 
+        padding: 12px; 
+        border-radius: 6px; 
+        border: 1px solid #ddd;
+        max-height: 400px;
+        overflow-y: auto;
+      }
+      .row { 
+        display: flex; 
+        gap: 12px; 
+        align-items: center; 
+        flex-wrap: wrap; 
+        margin: 12px 0; 
+      }
+      .muted { 
+        color: #666; 
+        font-size: 13px; 
+      }
+      .error { 
+        color: #c00; 
+        background: #fee; 
+        padding: 12px; 
+        border-radius: 6px; 
+      }
+      .success {
+        color: #060;
+        background: #efe;
+        padding: 12px;
+        border-radius: 6px;
+      }
+      .config-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin: 12px 0;
+      }
+      .config-item label {
+        display: block;
+        font-weight: 500;
+        margin-bottom: 4px;
+        font-size: 13px;
+      }
+      .config-item input {
+        width: 100%;
+        padding: 6px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+      }
+      .question-card {
+        background: white;
+        padding: 12px;
+        margin: 8px 0;
+        border-radius: 6px;
+        border-left: 4px solid #0066cc;
+      }
+      .question-text {
+        font-size: 15px;
+        font-weight: 500;
+        margin-bottom: 8px;
+      }
+      .question-meta {
+        font-size: 12px;
+        color: #666;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h2>Edge Question Generation Pipeline</h2>
+
+    <!-- Model Configuration -->
+    <div class="section">
+      <h3>Model Configuration</h3>
+      
+      <div class="row">
+        <label>
+          <strong>Model Path:</strong>
+          <input type="text" id="modelPath" value="smollm2_onnx" style="width: 300px; margin-left: 8px;">
+        </label>
+      </div>
+
+      <div class="config-grid">
+        <div class="config-item">
+          <label>Desired Questions</label>
+          <input type="number" id="desiredQuestions" value="4" min="1" max="10">
+        </div>
+        <div class="config-item">
+          <label>Temperature</label>
+          <input type="number" id="temperature" value="0.3" min="0" max="1" step="0.1">
+        </div>
+        <div class="config-item">
+          <label>Top P</label>
+          <input type="number" id="topP" value="0.9" min="0" max="1" step="0.1">
+        </div>
+        <div class="config-item">
+          <label>Max Output Tokens</label>
+          <input type="number" id="maxTokens" value="200" min="50" max="500">
+        </div>
+        <div class="config-item">
+          <label>Model Dtype</label>
+          <select id="modelDtype">
+            <option value="fp32">fp32 (Float32)</option>
+            <option value="fp16">fp16 (Float16)</option>
+            <option value="q8" selected>q8 (8-bit Quantized)</option>
+            <option value="q4">q4 (4-bit Quantized)</option>
+            <option value="q4f16">q4f16 (4-bit + FP16)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <label>
+          <input type="checkbox" id="parallelProcessing">
+          Enable Parallel Processing
+        </label>
+        <!-- <label style="margin-left: 16px;">
+          <input type="checkbox" id="useMockAdapter">
+          Use Mock Adapter (Testing)
+        </label> -->
+      </div>
+
+      <div class="row">
+        <button id="loadModelBtn">Load Model</button>
+        <span id="modelStatus" class="muted">Not loaded</span>
+      </div>
+    </div>
+
+    <!-- Article Input -->
+    <div class="section">
+      <h3>Article Input</h3>
+      <textarea id="articleText" placeholder="Paste your article text here...">Sweeping reduces friction by momentarily melting the tops of ice "pebbles," creating a thin film of water that acts as a lubricant. This allows the stone to travel farther, potentially extending its distance by 6 to 12 feet (approx. 2–4 meters). Straightness: Sweeping typically reduces the stone's "curl," keeping it on a straighter trajectory for a longer period.
+
+The skip (team captain) calls strategic shots and determines when and where to sweep. Communication between skip and sweepers is crucial, as small adjustments can significantly alter the stone's final position.
+
+Curling is often called "chess on ice" because of its strategic depth. Teams must decide whether to draw (place stones in the house), guard (block opponent's shots), or takeout (knock out opponent's stones).
+
+Positioning early stones can set up complex scenarios where later stones can capitalize. A well-placed guard can protect scoring stones or force the opponent into difficult shots.
+
+The "hammer" (last stone advantage) in each end is highly valuable. Teams often choose to score only one point to retain the hammer for the next end, rather than scoring multiple points without it.</textarea>
+
+      <div class="row">
+        <button id="generateBtn" disabled>Generate Questions</button>
+        <span id="generateStatus" class="muted"></span>
+      </div>
+    </div>
+
+    <!-- Results Output -->
+    <div class="section">
+      <h3>Generated Questions</h3>
+      <div id="questionsOutput">
+        <div class="muted">No questions generated yet. Load the model and click "Generate Questions".</div>
+      </div>
+    </div>
+
+    <!-- Pipeline Metrics -->
+    <div class="section">
+      <h3>Pipeline Metrics</h3>
+      <pre id="metricsOutput">No metrics available yet.</pre>
+    </div>
+
+    <!-- Debug Output -->
+    <div class="section">
+      <h3>Debug Output</h3>
+      <pre id="debugOutput">Console logs will appear here...</pre>
+    </div>
+
+    <script type="module">
+      import { env, pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm";
+      
+      // Import our modular pipeline
+      import { ArticleInput, GenerationConfig } from './pipeline_types.js';
+      import { WebGPUAdapter, MockAdapter } from './model_adapter.js';
+      import { QuestionGenerationPipeline } from './pipeline.js';
+
+      // Configure Transformers.js
+      env.allowLocalModels = true;
+      env.allowRemoteModels = false;
+      env.localModelPath = "onnx_adaption_web/";
+
+      // ========================================================================
+      // UI Elements
+      // ========================================================================
+
+      const modelPathEl = document.getElementById("modelPath");
+      const desiredQuestionsEl = document.getElementById("desiredQuestions");
+      const temperatureEl = document.getElementById("temperature");
+      const topPEl = document.getElementById("topP");
+      const maxTokensEl = document.getElementById("maxTokens");
+      const parallelProcessingEl = document.getElementById("parallelProcessing");
+      const useMockAdapterEl = document.getElementById("useMockAdapter");
+      const modelDtypeEl = document.getElementById("modelDtype");
+      
+      const loadModelBtn = document.getElementById("loadModelBtn");
+      const modelStatusEl = document.getElementById("modelStatus");
+      
+      const articleTextEl = document.getElementById("articleText");
+      const generateBtn = document.getElementById("generateBtn");
+      const generateStatusEl = document.getElementById("generateStatus");
+      
+      const questionsOutputEl = document.getElementById("questionsOutput");
+      const metricsOutputEl = document.getElementById("metricsOutput");
+      const debugOutputEl = document.getElementById("debugOutput");
+
+      // ========================================================================
+      // Global State
+      // ========================================================================
+
+      let generatorPipeline = null;
+      let questionPipeline = null;
+      let debugLog = [];
+
+      // ========================================================================
+      // Utility Functions
+      // ========================================================================
+
+      function setModelStatus(msg, isError = false) {
+        modelStatusEl.textContent = msg;
+        modelStatusEl.className = isError ? 'error' : 'muted';
+      }
+
+      function setGenerateStatus(msg, isError = false) {
+        generateStatusEl.textContent = msg;
+        generateStatusEl.className = isError ? 'error' : (msg.includes('✓') ? 'success' : 'muted');
+      }
+
+      function addDebugLog(message) {
+        const timestamp = new Date().toLocaleTimeString();
+        debugLog.push(`[${timestamp}] ${message}`);
+        if (debugLog.length > 50) debugLog.shift(); // Keep last 50 logs
+        debugOutputEl.textContent = debugLog.join('\n');
+        debugOutputEl.scrollTop = debugOutputEl.scrollHeight;
+      }
+
+      // Override console.log to capture in UI
+      const originalLog = console.log;
+      console.log = function(...args) {
+        originalLog.apply(console, args);
+        addDebugLog(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '));
+      };
+
+      // ========================================================================
+      // Model Loading
+      // ========================================================================
+
+      loadModelBtn.addEventListener("click", async () => {
+        const modelId = modelPathEl.value.trim();
+        if (!modelId) {
+          setModelStatus("Please enter a model path", true);
+          return;
+        }
+
+        const useMock = false; //useMockAdapterEl.checked;
+
+        try {
+          loadModelBtn.disabled = true;
+          generateBtn.disabled = true;
+          setModelStatus("Loading model...");
+          const selectedDtype = modelDtypeEl.value;
+          addDebugLog(`Using dtype: ${selectedDtype}`);
+          addDebugLog(`Starting model load: ${useMock ? 'Mock Adapter' : modelId}`);
+
+          if (useMock) {
+            // Use mock adapter for testing
+            const mockAdapter = new MockAdapter(500); // 500ms latency
+            await mockAdapter.isReady();
+            
+            questionPipeline = new QuestionGenerationPipeline(
+              mockAdapter,
+              new GenerationConfig({
+                temperature: parseFloat(temperatureEl.value),
+                topP: parseFloat(topPEl.value),
+                maxOutputTokens: parseInt(maxTokensEl.value)
+              }),
+              {
+                parallelProcessing: parallelProcessingEl.checked,
+                maxConcurrentChunks: 3
+              }
+            );
+            
+            setModelStatus("✓ Mock adapter ready");
+            addDebugLog("Mock adapter initialized successfully");
+          } else {
+            // Sanity check - verify tokenizer exists
+            const tokenizerUrl = `/onnx_adaption_web/${modelId}/tokenizer.json`;
+            addDebugLog(`Checking for tokenizer at: ${tokenizerUrl}`);
+            
+            const r = await fetch(tokenizerUrl);
+            if (!r.ok) {
+              throw new Error(`Cannot fetch tokenizer.json from ${tokenizerUrl}. Status: ${r.status}`);
+            }
+            addDebugLog(`Tokenizer found, status: ${r.status}`);
+
+            // Load the model with WebGPU
+            setModelStatus("Loading model with WebGPU...");
+            generatorPipeline = await pipeline("text-generation", modelId, {
+              device: "webgpu",
+              dtype: selectedDtype
+            });
+            addDebugLog("Model loaded successfully");
+
+            // Create WebGPU adapter
+            const adapter = new WebGPUAdapter(generatorPipeline);
+            await adapter.initialize();
+            addDebugLog("WebGPU adapter initialized");
+
+            // Create pipeline
+            questionPipeline = new QuestionGenerationPipeline(
+              adapter,
+              new GenerationConfig({
+                temperature: parseFloat(temperatureEl.value),
+                topP: parseFloat(topPEl.value),
+                maxOutputTokens: parseInt(maxTokensEl.value)
+              }),
+              {
+                parallelProcessing: parallelProcessingEl.checked,
+                maxConcurrentChunks: 3
+              }
+            );
+            
+            setModelStatus("✓ Model loaded and ready");
+            addDebugLog("Pipeline initialized successfully");
+          }
+
+          generateBtn.disabled = false;
+
+        } catch (e) {
+          console.error("Model loading error:", e);
+          setModelStatus(`❌ Error: ${e.message}`, true);
+          addDebugLog(`ERROR: ${e.message}`);
+        } finally {
+          loadModelBtn.disabled = false;
+        }
+      });
+
+      // ========================================================================
+      // Question Generation
+      // ========================================================================
+
+      generateBtn.addEventListener("click", async () => {
+        const articleText = articleTextEl.value.trim();
+        if (!articleText) {
+          setGenerateStatus("Please enter article text", true);
+          return;
+        }
+
+        if (!questionPipeline) {
+          setGenerateStatus("Please load the model first", true);
+          return;
+        }
+
+        try {
+          generateBtn.disabled = true;
+          setGenerateStatus("Generating questions...");
+          addDebugLog("=".repeat(60));
+          addDebugLog("Starting question generation pipeline");
+
+          // Create article input
+          const article = new ArticleInput(
+            articleText,
+            parseInt(desiredQuestionsEl.value)
+          );
+          addDebugLog(`Article length: ${article.text.length} characters`);
+          addDebugLog(`Desired questions: ${article.desiredQuestions}`);
+
+          // Run pipeline
+          const startTime = performance.now();
+          const result = await questionPipeline.generateWithMetrics(article);
+          const endTime = performance.now();
+          
+          addDebugLog(`Pipeline completed in ${(endTime - startTime).toFixed(2)}ms`);
+
+          // Display questions
+          if (result.questions.length === 0) {
+            questionsOutputEl.innerHTML = '<div class="error">No questions were generated</div>';
+          } else {
+            let html = '';
+            result.questions.forEach((q, idx) => {
+              html += `
+                <div class="question-card">
+                  <div class="question-text">${idx + 1}. ${q.question}</div>
+                  <div class="question-meta">
+                    Type: ${q.type} | 
+                    Chunk: ${q.sourceChunkId} | 
+                    Confidence: ${(q.confidenceScore * 100).toFixed(0)}%
+                  </div>
+                </div>
+              `;
+            });
+            questionsOutputEl.innerHTML = html;
+          }
+
+          // Display metrics
+          const metrics = result.metrics.toDict();
+          metricsOutputEl.textContent = JSON.stringify(metrics, null, 2);
+
+          setGenerateStatus(`✓ Generated ${result.questions.length} questions in ${metrics.latencyMs.toFixed(0)}ms`);
+          addDebugLog(`Successfully generated ${result.questions.length} questions`);
+
+        } catch (e) {
+          console.error("Generation error:", e);
+          setGenerateStatus(`❌ Error: ${e.message}`, true);
+          questionsOutputEl.innerHTML = `<div class="error">${e.toString()}</div>`;
+          addDebugLog(`ERROR: ${e.toString()}`);
+        } finally {
+          generateBtn.disabled = false;
+        }
+      });
+
+      // ========================================================================
+      // Initial Setup
+      // ========================================================================
+
+      addDebugLog("Application initialized. Ready to load model.");
+      addDebugLog("Tip: Check the checkbox to use Mock Adapter for testing without loading a model.");
+
+    </script>
+  </body>
+</html>

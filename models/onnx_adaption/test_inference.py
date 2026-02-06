@@ -82,9 +82,9 @@ async def main():
         
         # Use more generous token limit for generation
         config = GenerationConfig(
-            max_output_tokens=500,  # Reduced from 800
-            temperature=0.7,
-            top_p=0.9,
+            max_output_tokens=64,   # 32–80 sweet spot
+            temperature=0.2,        # 0.0 for JSON
+            top_p=1.0,              # or omit
         )
         
         pipeline = QuestionGenerationPipeline(adapter=adapter, config=config)

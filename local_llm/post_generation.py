@@ -1,6 +1,6 @@
 """
 Edge Question Generation Pipeline - Post-Generation (Simplified)
-Basic validation and selection logic
+Minimal validation, no evidence checking
 """
 
 from typing import List
@@ -8,13 +8,14 @@ from src.pipeline_types import (
     QuestionCandidate,
     ValidationResult,
     RejectedCandidate,
+    RankedCandidate,
     FinalQuestion,
     Chunk,
 )
 
 
 # ============================================================================
-# Simplified Validation - Just count check
+# Minimal Validation - No Evidence Checking
 # ============================================================================
 
 def validate_candidates(
@@ -23,25 +24,40 @@ def validate_candidates(
     allowed_styles=None  # Keep signature compatible
 ) -> ValidationResult:
     """
-    Simplified validation - just return all candidates as valid.
+    Minimal validation - only basic checks, no evidence validation.
+    
+    Checks:
+    - Question exists and not empty
+    - Evidence exists (but NOT validated against chunk)
     
     Args:
         candidates: Raw question candidates
-        chunks: Source chunks (unused in simplified version)
+        chunks: Source chunks (unused - we don't validate evidence content)
         allowed_styles: Unused, kept for API compatibility
         
     Returns:
-        ValidationResult with all candidates marked as valid
+        ValidationResult with valid and rejected candidates
     """
-    # All candidates are valid in simplified mode
-    valid = candidates
-    rejected = []
+    valid: List[QuestionCandidate] = []
+    rejected: List[RejectedCandidate] = []
+    
+    for candidate in candidates:
+        # Check 1: Question exists and not empty
+        if not candidate.question or len(candidate.question.strip()) < 10:
+            rejected.append(RejectedCandidate(
+                candidate=candidate,
+                reason="Question too short or empty"
+            ))
+            continue
+        
+        # Passed all checks
+        valid.append(candidate)
     
     return ValidationResult(valid=valid, rejected=rejected)
 
 
 # ============================================================================
-# No-op Deduplication
+# No Deduplication
 # ============================================================================
 
 def deduplicate_candidates(
@@ -49,7 +65,7 @@ def deduplicate_candidates(
     similarity_threshold: float = 0.7  # Unused, kept for API compatibility
 ) -> List[QuestionCandidate]:
     """
-    Simplified deduplication - just return all candidates.
+    No deduplication - return all candidates as-is.
     
     Args:
         candidates: Valid question candidates
@@ -62,25 +78,23 @@ def deduplicate_candidates(
 
 
 # ============================================================================
-# Simplified Ranking - Keep original order
+# Neutral Ranking - Keep Original Order
 # ============================================================================
 
 def rank_candidates(
     candidates: List[QuestionCandidate],
     chunks: List[Chunk]
-) -> List['RankedCandidate']:
+) -> List[RankedCandidate]:
     """
-    Simplified ranking - just wrap candidates with neutral scores.
+    Neutral ranking - wrap candidates with score=1.0, keep original order.
     
     Args:
         candidates: Valid, deduplicated candidates
         chunks: Source chunks (unused)
         
     Returns:
-        Candidates wrapped as RankedCandidate with score=1.0
+        Candidates wrapped as RankedCandidate with neutral scores
     """
-    from src.pipeline_types import RankedCandidate
-    
     ranked = []
     for candidate in candidates:
         ranked.append(RankedCandidate(
@@ -93,16 +107,16 @@ def rank_candidates(
 
 
 # ============================================================================
-# Simplified Selection - Take first K
+# Simple Selection - Take First K
 # ============================================================================
 
 def select_final_questions(
-    ranked: List['RankedCandidate'],
+    ranked: List[RankedCandidate],
     k: int,
     diversity_threshold: float = 0.6  # Unused
 ) -> List[FinalQuestion]:
     """
-    Simplified selection - take first K questions.
+    Simple selection - take first K questions.
     
     Args:
         ranked: Ranked candidates

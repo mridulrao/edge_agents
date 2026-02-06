@@ -467,17 +467,30 @@ class OrtxCausalLM:
         top_p: float,
         stop_sequences: Optional[List[str]],
     ) -> str:
-        # Handle chat format with proper template application
-        original_prompt = prompt  # Keep for later stripping
-        
+        """
+        Generate text from the model.
+
+        Key improvements vs your current version:
+        - Fixes attention_mask shape bug in KV-cache path (was using ones_like(generated_ids) for a 1-token step)
+        - Makes sampling robust: clamps top_p, supports greedy when temperature<=0
+        - Adds optional "JSON completion" early-stop (balanced braces) so small models don't ramble
+        - Checks stop sequences on incremental output but avoids re-decoding huge strings unnecessarily
+        - Keeps decoding on NEW tokens only (your good change)
+        """
+
+        # ---------------------------------------------------------------------
+        # 0) Prompt formatting (unchanged logic, just a bit safer)
+        # ---------------------------------------------------------------------
+        if prompt is None:
+            prompt = ""
+
         if isinstance(prompt, list):
-            # Apply chat template if available
-            if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template:
+            if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
                 try:
                     formatted_prompt = self.tokenizer.apply_chat_template(
                         prompt,
                         tokenize=False,
-                        add_generation_prompt=True  # This adds the assistant prefix
+                        add_generation_prompt=True,
                     )
                     logger.info(f"Applied chat template, length: {len(formatted_prompt)}")
                 except Exception as e:
@@ -489,29 +502,60 @@ class OrtxCausalLM:
                 from src.model_adapter import format_chat_prompt
                 formatted_prompt = format_chat_prompt(prompt, self.tokenizer)
         else:
-            formatted_prompt = prompt
-        
-        # Log the actual prompt being sent (truncated)
+            formatted_prompt = str(prompt)
+
         logger.info(f"Formatted prompt (first 300 chars):\n{formatted_prompt[:300]}")
         logger.info(f"Formatted prompt (last 200 chars):\n{formatted_prompt[-200:]}")
-        
+
+        # ---------------------------------------------------------------------
+        # 1) Tokenize
+        # ---------------------------------------------------------------------
         enc = self.tokenizer(formatted_prompt, return_tensors="np", add_special_tokens=False)
         input_ids = enc["input_ids"]
         attention_mask = enc.get("attention_mask")
         if attention_mask is None:
             attention_mask = np.ones_like(input_ids, dtype=np.int64)
 
-        # Store the input length to strip the prompt later
         input_length = int(input_ids.shape[1])
         logger.info(f"Input tokens: {input_length}")
-        
+
         generated_ids = input_ids.copy()
 
-        use_cache = bool(self._kv["enabled"])
+        # Guardrails
+        try:
+            max_new_tokens = int(max_new_tokens)
+        except Exception:
+            max_new_tokens = 64
+        if max_new_tokens <= 0:
+            return ""
+
+        # Clamp top_p safely
+        if top_p is None:
+            top_p = 1.0
+        try:
+            top_p = float(top_p)
+        except Exception:
+            top_p = 1.0
+        if top_p <= 0.0:
+            top_p = 1.0
+        if top_p > 1.0:
+            top_p = 1.0
+
+        # Normalize temperature
+        if temperature is None:
+            temperature = 0.0
+        try:
+            temperature = float(temperature)
+        except Exception:
+            temperature = 0.0
+
+        use_cache = bool(self._kv.get("enabled", False))
         past: Optional[Dict[str, np.ndarray]] = None
         past_length = int(generated_ids.shape[1])
 
-        # [... rest of prefill code stays the same ...]
+        # ---------------------------------------------------------------------
+        # 2) Prefill
+        # ---------------------------------------------------------------------
         feeds = self._build_feeds_base(generated_ids, attention_mask)
 
         if self._requires_past_inputs:
@@ -526,69 +570,143 @@ class OrtxCausalLM:
             present = self._extract_present(ort_out)
             past = self._present_to_past(present)
 
-        # Decode loop
-        for step in range(int(max_new_tokens)):
+        # ---------------------------------------------------------------------
+        # 3) Helpers for robust early stop
+        # ---------------------------------------------------------------------
+        stop_sequences = stop_sequences or []
+
+        # If you're doing JSON-only outputs, adding a stop on "\n\n" often helps,
+        # but do NOT force it here; caller decides.
+        # stop_sequences = list(dict.fromkeys(stop_sequences))  # de-dupe if needed
+
+        # JSON completion detector: stop when we have a complete first JSON object
+        # (balanced braces), ignoring braces in strings.
+        def _json_object_complete(text: str) -> bool:
+            start = text.find("{")
+            if start == -1:
+                return False
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+                c = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                    continue
+                else:
+                    if c == '"':
+                        in_str = True
+                        continue
+                    if c == "{":
+                        depth += 1
+                        continue
+                    if c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            # completed first object
+                            return True
+            return False
+
+        # Incremental decode buffer: avoid decoding huge strings each step.
+        # We still decode "new tokens" each step but keep the last decoded text in memory.
+        last_text_out = ""
+
+        # ---------------------------------------------------------------------
+        # 4) Decode loop
+        # ---------------------------------------------------------------------
+        for step in range(max_new_tokens):
             last_logits = logits[:, -1, :].astype(np.float32)
             last_logits = _apply_temperature(last_logits, temperature)
 
-            if temperature is None or temperature <= 0:
+            # Greedy when temp <= 0
+            if temperature <= 0.0:
                 next_id = int(np.argmax(last_logits, axis=-1)[0])
             else:
                 probs = _softmax(last_logits[0])
-                p = float(top_p) if top_p is not None else 1.0
-                next_id = _top_p_sample(probs, p)
+                next_id = _top_p_sample(probs, top_p)
 
-            next_token = np.array([[next_id]], dtype=np.int64)
+            next_token = np.array([[int(next_id)]], dtype=np.int64)
             generated_ids = np.concatenate([generated_ids, next_token], axis=1)
 
-            # Check for EOS
-            if next_id == int(self.tokenizer.eos_token_id):
+            # EOS check
+            if self.tokenizer.eos_token_id is not None and next_id == int(self.tokenizer.eos_token_id):
                 logger.info(f"EOS token encountered at step {step}")
                 break
 
-            # Decode only the NEW tokens (strip the prompt)
-            new_tokens = generated_ids[0, input_length:]  # ← Key change
+            # Decode only NEW tokens
+            new_tokens = generated_ids[0, input_length:]
             text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            
-            # Check stop sequences on the generated portion only
-            if _find_stop_on_text(text_out, stop_sequences):
+            last_text_out = text_out  # keep latest
+
+            # Stop-sequence check
+            if stop_sequences and _find_stop_on_text(text_out, stop_sequences):
                 logger.info(f"Stop sequence found at step {step}")
                 break
 
-            # [... rest of cache/no-cache logic stays the same ...]
+            # JSON completion early-stop (helps a lot for small models that keep talking)
+            # This is safe even if caller didn't ask for it; it only triggers if a JSON object is present.
+            if _json_object_complete(text_out):
+                logger.info(f"JSON object completed at step {step}")
+                break
+
+            # -----------------------------------------------------------------
+            # Next-step inference
+            # -----------------------------------------------------------------
             if use_cache:
+                # IMPORTANT FIX:
+                # You are feeding ONLY 1 token (next_token), so attention_mask must be (1,1),
+                # not ones_like(generated_ids).
                 input_step = next_token
-                attention_mask = np.ones_like(generated_ids, dtype=np.int64)
-                feeds = self._build_feeds_base(input_step, attention_mask)
+                attention_mask_step = np.ones_like(input_step, dtype=np.int64)
+
+                feeds = self._build_feeds_base(input_step, attention_mask_step)
+
+                # position_ids for step token (past_length points to next position)
                 if "position_ids" in self.input_names:
                     feeds["position_ids"] = np.array([[past_length]], dtype=np.int64)
+
                 if self._requires_past_inputs:
                     if past is None:
                         feeds.update(_build_past_kv(self.session_cpu, self.config, batch=1, past_len=0))
                     else:
                         feeds.update(past)
+
                 ort_out = self._run_accel_or_cpu(feeds)
                 logits = self._logits_from_outputs(ort_out)
+
                 present = self._extract_present(ort_out)
                 past = self._present_to_past(present)
                 past_length += 1
             else:
-                attention_mask = np.ones_like(generated_ids, dtype=np.int64)
-                feeds = self._build_feeds_base(generated_ids, attention_mask)
+                # No-cache path: full forward on entire sequence
+                attention_mask_full = np.ones_like(generated_ids, dtype=np.int64)
+                feeds = self._build_feeds_base(generated_ids, attention_mask_full)
+
                 if self._requires_past_inputs:
                     feeds.update(_build_past_kv(self.session_cpu, self.config, batch=1, past_len=0))
                     ort_out = self._run_cpu(feeds)
                 else:
                     ort_out = self._run_accel_or_cpu(feeds)
+
                 logits = self._logits_from_outputs(ort_out)
 
-        # Final decode - only the generated portion
-        new_tokens = generated_ids[0, input_length:]
-        text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        
-        logger.info(f"Generated {len(new_tokens)} new tokens")
+        # ---------------------------------------------------------------------
+        # 5) Final decode (NEW tokens only)
+        # ---------------------------------------------------------------------
+        if last_text_out:
+            text_out = last_text_out
+        else:
+            new_tokens = generated_ids[0, input_length:]
+            text_out = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        logger.info(f"Generated {generated_ids.shape[1] - input_length} new tokens")
         logger.info(f"Output (first 500 chars): {text_out[:500]}")
-        
+
         return text_out.strip()
 
 
@@ -659,7 +777,7 @@ class OnnxRuntimeAdapter(ModelAdapter):
                     return self._model.generate_text(
                         prompt=prompt,
                         max_new_tokens=int(generation_config.max_output_tokens),
-                        temperature=float(getattr(generation_config, "temperature", 0.7) or 0.7),
+                        temperature=float(getattr(generation_config, "temperature", 0.1) or 0.1),
                         top_p=float(getattr(generation_config, "top_p", 0.9) or 0.9),
                         stop_sequences=getattr(generation_config, "stop_sequences", None),
                     )
