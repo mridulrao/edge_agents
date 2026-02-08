@@ -180,7 +180,7 @@
     <!-- Article Input -->
     <div class="section">
       <h3>Article Input</h3>
-      <textarea id="articleText" placeholder="Paste your article text here...">Sweeping reduces friction by momentarily melting the tops of ice "pebbles," creating a thin film of water that acts as a lubricant. This allows the stone to travel farther, potentially extending its distance by 6 to 12 feet (approx. 2–4 meters). Straightness: Sweeping typically reduces the stone's "curl," keeping it on a straighter trajectory for a longer period.
+      <textarea id="articleText" placeholder="Paste your article text here...">Sweeping reduces friction by momentarily melting the tops of ice "pebbles," creating a thin film of water that acts as a lubricant. This allows the stone to travel farther, potentially extending its distance by 6 to 12 feet (approx. 2â€“4 meters). Straightness: Sweeping typically reduces the stone's "curl," keeping it on a straighter trajectory for a longer period.
 
 The skip (team captain) calls strategic shots and determines when and where to sweep. Communication between skip and sweepers is crucial, as small adjustments can significantly alter the stone's final position.
 
@@ -204,6 +204,19 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
       </div>
     </div>
 
+    <!-- Memory Profile -->
+    <div class="section">
+      <h3>Memory Profile</h3>
+      <pre id="memoryProfileOutput">No memory profile available. Load the model to see memory metrics.</pre>
+    </div>
+
+
+    <!-- Memory Profile -->
+    <div class="section">
+      <h3>Memory Profile</h3>
+      <pre id="memoryProfileOutput">No memory profile available. Load the model to see memory metrics.</pre>
+    </div>
+
     <!-- Pipeline Metrics -->
     <div class="section">
       <h3>Pipeline Metrics</h3>
@@ -223,7 +236,12 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
       import { ArticleInput, GenerationConfig } from './pipeline_types.js';
       import { WebGPUAdapter, MockAdapter } from './model_adapter.js';
       import { QuestionGenerationPipeline } from './pipeline.js';
-
+      import { 
+        PipelineMemoryProfiler, 
+        profileModelLoad,
+        printProfilingSupport 
+      } from './memory_profiler.js';
+      
       // Configure Transformers.js
       env.allowLocalModels = true;
       env.allowRemoteModels = false;
@@ -252,6 +270,7 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
       const questionsOutputEl = document.getElementById("questionsOutput");
       const metricsOutputEl = document.getElementById("metricsOutput");
       const debugOutputEl = document.getElementById("debugOutput");
+      const memoryProfileOutputEl = document.getElementById("memoryProfileOutput");
 
       // ========================================================================
       // Global State
@@ -260,6 +279,7 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
       let generatorPipeline = null;
       let questionPipeline = null;
       let debugLog = [];
+      let memoryProfiler = null; // Memory profiler instance
 
       // ========================================================================
       // Utility Functions
@@ -272,7 +292,7 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
 
       function setGenerateStatus(msg, isError = false) {
         generateStatusEl.textContent = msg;
-        generateStatusEl.className = isError ? 'error' : (msg.includes('✓') ? 'success' : 'muted');
+        generateStatusEl.className = isError ? 'error' : (msg.includes('âœ“') ? 'success' : 'muted');
       }
 
       function addDebugLog(message) {
@@ -329,7 +349,7 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
               }
             );
             
-            setModelStatus("✓ Mock adapter ready");
+            setModelStatus("âœ“ Mock adapter ready");
             addDebugLog("Mock adapter initialized successfully");
           } else {
             // Sanity check - verify tokenizer exists
@@ -342,18 +362,39 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
             }
             addDebugLog(`Tokenizer found, status: ${r.status}`);
 
-            // Load the model with WebGPU
-            setModelStatus("Loading model with WebGPU...");
-            generatorPipeline = await pipeline("text-generation", modelId, {
-              device: "webgpu",
-              dtype: selectedDtype
-            });
-            addDebugLog("Model loaded successfully");
+            // Initialize memory profiler
+            memoryProfiler = new PipelineMemoryProfiler();
+            await memoryProfiler.captureBaseline();
+            addDebugLog("Memory profiler initialized, baseline captured");
+
+            // Load the model with WebGPU and profiling
+            setModelStatus("Loading model with WebGPU and profiling...");
+            
+            const { result, profiler: loadProfiler } = await profileModelLoad(
+              async () => {
+                return await pipeline("text-generation", modelId, {
+                  device: "webgpu",
+                  dtype: selectedDtype
+                });
+              },
+              modelId,
+              selectedDtype
+            );
+            
+            generatorPipeline = result;
+            memoryProfiler = loadProfiler;
+            addDebugLog("Model loaded successfully with profiling");
+
+            // Estimate model size
+            await memoryProfiler.modelLoadMetrics.estimateModelSize();
 
             // Create WebGPU adapter
             const adapter = new WebGPUAdapter(generatorPipeline);
             await adapter.initialize();
-            addDebugLog("WebGPU adapter initialized");
+            
+            // Attach memory profiler to adapter
+            adapter.setMemoryProfiler(memoryProfiler);
+            addDebugLog("WebGPU adapter initialized with memory profiling");
 
             // Create pipeline
             questionPipeline = new QuestionGenerationPipeline(
@@ -369,7 +410,19 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
               }
             );
             
-            setModelStatus("✓ Model loaded and ready");
+            // Display initial memory profile
+            const loadReport = memoryProfiler.generateReport();
+            const loadSummary = `📊 Model Load Profile:
+   • Load Time: ${loadReport.modelLoad.loadDurationSec.toFixed(2)}s
+   • Memory Overhead: ${loadReport.modelLoad.memoryDeltaMB.toFixed(2)} MB
+   • Model Size: ${loadReport.modelLoad.modelSizeMB > 0 ? loadReport.modelLoad.modelSizeMB.toFixed(2) + ' MB' : 'N/A'}
+   • Baseline Memory: ${loadReport.baseline.jsHeapUsedSizeMB.toFixed(2)} MB
+   • After Load: ${loadReport.modelLoad.memoryAfter.jsHeapUsedSizeMB.toFixed(2)} MB`;
+            
+            memoryProfileOutputEl.textContent = loadSummary;
+            addDebugLog("Memory profile updated");
+            
+            setModelStatus("Model loaded and ready");
             addDebugLog("Pipeline initialized successfully");
           }
 
@@ -377,7 +430,7 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
 
         } catch (e) {
           console.error("Model loading error:", e);
-          setModelStatus(`❌ Error: ${e.message}`, true);
+          setModelStatus(`âŒ Error: ${e.message}`, true);
           addDebugLog(`ERROR: ${e.message}`);
         } finally {
           loadModelBtn.disabled = false;
@@ -445,12 +498,39 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
           const metrics = result.metrics.toDict();
           metricsOutputEl.textContent = JSON.stringify(metrics, null, 2);
 
-          setGenerateStatus(`✓ Generated ${result.questions.length} questions in ${metrics.latencyMs.toFixed(0)}ms`);
+          // Update full memory report
+          if (memoryProfiler) {
+            const fullReport = memoryProfiler.generateReport();
+            const reportSummary = `📊 Full Memory Profile:
+
+MODEL LOAD:
+   • Load Time: ${fullReport.modelLoad.loadDurationSec.toFixed(2)}s
+   • Memory Overhead: ${fullReport.modelLoad.memoryDeltaMB.toFixed(2)} MB
+   • Model Size: ${fullReport.modelLoad.modelSizeMB > 0 ? fullReport.modelLoad.modelSizeMB.toFixed(2) + ' MB' : 'N/A'}
+
+INFERENCE:
+   • Total Inferences: ${fullReport.inference.totalInferences}
+   • Total Time: ${fullReport.inference.totalTimeSec.toFixed(2)}s
+   • Average Time: ${fullReport.inference.averageTimeMs.toFixed(2)} ms
+   • Average Memory Delta: ${fullReport.inference.averageMemoryDeltaMB.toFixed(2)} MB
+   • Peak Memory: ${fullReport.inference.peakMemoryMB.toFixed(2)} MB
+
+SUMMARY:
+   • Total Memory Overhead: ${fullReport.summary.totalMemoryOverheadMB.toFixed(2)} MB
+   • Peak Memory Usage: ${fullReport.summary.peakMemoryMB.toFixed(2)} MB`;
+
+            memoryProfileOutputEl.textContent = reportSummary;
+            
+            // Also print to console
+            memoryProfiler.printReport();
+          }
+
+                    setGenerateStatus(`âœ“ Generated ${result.questions.length} questions in ${metrics.latencyMs.toFixed(0)}ms`);
           addDebugLog(`Successfully generated ${result.questions.length} questions`);
 
         } catch (e) {
           console.error("Generation error:", e);
-          setGenerateStatus(`❌ Error: ${e.message}`, true);
+          setGenerateStatus(`âŒ Error: ${e.message}`, true);
           questionsOutputEl.innerHTML = `<div class="error">${e.toString()}</div>`;
           addDebugLog(`ERROR: ${e.toString()}`);
         } finally {
@@ -463,7 +543,11 @@ The "hammer" (last stone advantage) in each end is highly valuable. Teams often 
       // ========================================================================
 
       addDebugLog("Application initialized. Ready to load model.");
-      addDebugLog("Tip: Check the checkbox to use Mock Adapter for testing without loading a model.");
+      
+      // Print memory profiling support info
+      if (typeof printProfilingSupport === 'function') {
+        printProfilingSupport();
+      }
 
     </script>
   </body>

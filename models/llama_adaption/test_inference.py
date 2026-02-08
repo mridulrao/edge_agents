@@ -1,156 +1,269 @@
 #!/usr/bin/env python3
 """
-Main entry point for Edge Question Generation with LlamaServer
-Quick test/demo script - UPDATED VERSION
+Profiles llama-server load + inference and writes JSONL.
+
+Usage:
+  pip install psutil
+  python profile_llama_server_test.py --out profiles/falcon90m_bf16.jsonl --interval 0.2
 """
 
-import asyncio
-import sys
-from pathlib import Path
+from __future__ import annotations
 
-# Add project root to path
+import argparse
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+import psutil
+
+import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from models.llama_adaption.llama_server_adapter import create_adapter_with_server
-from src.pipeline import QuestionGenerationPipeline
-from src.pipeline_types import ArticleInput, GenerationConfig
+from local_llm.pipeline import QuestionGenerationPipeline
+from local_llm.pipeline_types import ArticleInput, GenerationConfig
 
 
-async def main():
-    """Run a simple test of the question generation pipeline"""
-    
-    print("=" * 60)
-    print("Edge Question Generation - LlamaServer Test")
-    print("=" * 60)
-    
-    # Configuration
-    MODEL_PATH = "models/models/bartowski_google_gemma-3-270m-it-GGUF/google_gemma-3-270m-it-Q8_0.gguf"
+class JsonlLogger:
+    def __init__(self, path: str):
+        self.path = path
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, obj: Dict[str, Any]) -> None:
+        obj = dict(obj)
+        obj.setdefault("ts_unix", time.time())
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _bytes_to_mb(x: int) -> float:
+    return float(x) / (1024.0 * 1024.0)
+
+
+@dataclass
+class ProcMem:
+    rss_mb: float
+    vms_mb: float
+    uss_mb: Optional[float] = None
+
+
+def read_process_memory(pid: int) -> ProcMem:
+    p = psutil.Process(pid)
+    mi = p.memory_info()
+    rss = _bytes_to_mb(mi.rss)
+    vms = _bytes_to_mb(getattr(mi, "vms", 0))
+
+    uss = None
+    try:
+        mfi = p.memory_full_info()
+        if hasattr(mfi, "uss"):
+            uss = _bytes_to_mb(mfi.uss)
+    except Exception:
+        pass
+
+    return ProcMem(rss_mb=rss, vms_mb=vms, uss_mb=uss)
+
+
+async def sample_process_memory(
+    pid: int,
+    logger: JsonlLogger,
+    stage: str,
+    interval_s: float,
+    stop_event: asyncio.Event,
+) -> Dict[str, Any]:
+    rss_peak = 0.0
+    vms_peak = 0.0
+    uss_peak = None
+    samples = 0
+
+    while not stop_event.is_set():
+        try:
+            mem = read_process_memory(pid)
+            rss_peak = max(rss_peak, mem.rss_mb)
+            vms_peak = max(vms_peak, mem.vms_mb)
+            if mem.uss_mb is not None:
+                uss_peak = mem.uss_mb if uss_peak is None else max(uss_peak, mem.uss_mb)
+
+            logger.write({
+                "event": "mem_sample",
+                "stage": stage,
+                "pid": pid,
+                "rss_mb": mem.rss_mb,
+                "vms_mb": mem.vms_mb,
+                "uss_mb": mem.uss_mb,
+            })
+            samples += 1
+
+        except psutil.NoSuchProcess:
+            logger.write({"event": "mem_sample", "stage": stage, "pid": pid, "error": "process_exited"})
+            break
+        except Exception as e:
+            logger.write({"event": "mem_sample", "stage": stage, "pid": pid, "error": str(e)})
+
+        await asyncio.sleep(interval_s)
+
+    return {
+        "rss_peak_mb": rss_peak,
+        "vms_peak_mb": vms_peak,
+        "uss_peak_mb": uss_peak,
+        "samples": samples,
+    }
+
+
+async def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="profiles/llama_profile.jsonl")
+    ap.add_argument("--interval", type=float, default=0.2)
+    ap.add_argument("--ctx", type=int, default=1048)
+    ap.add_argument("--max_out", type=int, default=200)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args()
+
+    logger = JsonlLogger(args.out)
+
+    MODEL_PATH = "models/llama_adaption/models/unsloth_gemma-3-270m-it-GGUF/gemma-3-270m-it-UD-Q4_K_XL.gguf"
     LLAMA_SERVER_PATH = "models/llama.cpp/build/bin/llama-server"
-    
-    # Check if model exists
+
     if not Path(MODEL_PATH).exists():
-        print(f"\n❌ Model not found: {MODEL_PATH}")
+        print(f"❌ Model not found: {MODEL_PATH}")
         return 1
-    
-    # Sample article for testing
+
     sample_article = ArticleInput(
         text="""
-        To enable conversion tracking in your ad platform, start by navigating to 
-        Tools > Conversions in the main menu. Click the + button to create a new 
-        conversion action.
-        
-        You can track three main types of conversions: web conversions, app installs, 
-        or phone calls. Each type requires different setup steps and configurations.
-        
-        For web conversions, you'll need to install a tracking tag on your website. 
-        Copy the provided tracking code snippet and paste it into your website's 
-        <head> section. The tag should fire when a user completes your desired action, 
-        such as making a purchase or submitting a lead form.
-        
-        To configure app install tracking, integrate with your mobile measurement 
-        partner (MMP). Select your MMP from the dropdown menu - options include 
-        AppsFlyer, Adjust, or Firebase. You'll need to provide your app ID and 
-        API credentials from your MMP dashboard.
-        
-        For phone call tracking, you can set up call extensions or use a forwarding 
-        number. The platform will track calls that come through your ads and attribute 
-        them to the appropriate campaigns.
-        
-        After setting up tracking, you can use conversion data to optimize your 
-        campaigns. Set bid strategies based on conversion goals, create audiences 
-        of converters, and analyze which keywords and ad groups drive the most 
-        valuable actions.
-        """,
-        desired_questions=4
+Skateboarding began as a desperate attempt to catch a wave on land. In the late 1950s, surfers in California sought a way to practice their balance when the ocean was calm. They nailed clay roller skate wheels to wooden planks and crates, creating a crude vehicle they called sidewalk surfing. These early riders emulated the fluid, carving movements of the water, unaware that they were laying the foundation for a global cultural phenomenon.
+The sport underwent a massive technological leap in the early 1970s with the invention of the polyurethane wheel. Before this, wheels were made of metal or clay, which offered no grip and turned every pebble into a hazard. The new urethane wheels provided a smooth, grippy ride that allowed skaters to reach higher speeds and perform tighter turns. This era also saw the legendary Z-Boys of Santa Monica take advantage of a severe California drought by sneaking into empty, bowl-shaped swimming pools. This transition from flat ground to vertical walls gave birth to aerial maneuvers and transformed the urban landscape into a giant playground.
+By the 1980s, skateboarding had moved away from the surf-inspired style and into the streets. Led by innovators like Alan Gelfand, who invented the ollie, and Rodney Mullen, who pioneered technical flip tricks, the board became an extension of the body that could leap over obstacles and slide down handrails. This period solidified skateboarding as a counterculture movement, deeply entwined with punk rock and DIY aesthetics. It was more than a sport; it was a rebellious identity that challenged the traditional use of public space.
+The 1990s and 2000s brought skateboarding into the mainstream through the X Games and popular video games, turning professional skaters into household names. Despite this commercial success, the core of the activity remained rooted in the community and the relentless pursuit of individual style. In 2021, the journey reached a historic milestone when skateboarding debuted at the Tokyo Olympic Games. Today, it is recognized as a legitimate athletic discipline, yet it retains its soul as a creative art form. Whether in a high-tech Olympic park or on a gritty city curb, skateboarding continues to represent a unique blend of resilience, freedom, and the endless reimagining of the world around us.""".strip(),
+        desired_questions=4,
     )
-    
+
+    adapter = None
     try:
-        # Create adapter with auto-managed server
-        print("\n📦 Starting llama-server...")
-        print(f"   Model: {MODEL_PATH}")
-        print(f"   Server: {LLAMA_SERVER_PATH}")
-        print(f"   This may take 1-2 minutes for first load...\n")
-        
+        logger.write({
+            "event": "run_start",
+            "model_path": MODEL_PATH,
+            "ctx_size": args.ctx,
+            "max_output_tokens": args.max_out,
+            "threads": args.threads,
+            "port": args.port,
+        })
+
+        # ----------------------------
+        # Start server + sample memory during load
+        # ----------------------------
+        t0 = time.perf_counter()
         adapter = await create_adapter_with_server(
             model_path=MODEL_PATH,
             host="127.0.0.1",
-            port=8080,
-            n_gpu_layers=0,  # Set to -1 or higher number for GPU
-            ctx_size=4096,
-            n_threads=4,
+            port=args.port,
+            n_gpu_layers=0,
+            ctx_size=args.ctx,
+            n_threads=args.threads,
             llama_server_path=LLAMA_SERVER_PATH,
         )
-        
-        # Wait for readiness
-        print("⏳ Waiting for server to load model...")
-        ready = await adapter.wait_until_ready(max_wait_seconds=180)
-        
-        if not ready:
-            print("❌ Server failed to become ready within timeout")
+        t1 = time.perf_counter()
+
+        pid = adapter.get_server_pid() or (adapter.server_manager.pid if adapter.server_manager else None)
+        if pid is None:
+            logger.write({"event": "error", "error": "missing_pid"})
+            print("❌ Could not determine llama-server PID")
             return 1
-        
-        print("✓ Server ready!\n")
-        
-        # Create pipeline with custom config (more tokens)
-        print("🔧 Creating pipeline...")
-        
-        # Use more generous token limit for generation
-        config = GenerationConfig(
-            max_output_tokens=800,  # Increased from 200 to 800
-            temperature=0.7,  # Slightly higher for more creativity
-            top_p=0.9,
-        )
-        
+
+        logger.write({
+            "event": "server_spawned",
+            "pid": pid,
+            "spawn_latency_ms": (t1 - t0) * 1000.0,
+        })
+
+        # If manager captured load stats, log them
+        if adapter.server_manager and adapter.server_manager.last_start_stats:
+            logger.write({
+                "event": "manager_start_stats",
+                "pid": pid,
+                "stats": adapter.server_manager.last_start_stats,
+            })
+
+        # Optionally log /props
+        try:
+            props = await adapter.server_manager.get_server_info() if adapter.server_manager else None
+            logger.write({"event": "server_props", "pid": pid, "props": props})
+        except Exception as e:
+            logger.write({"event": "server_props", "pid": pid, "error": str(e)})
+
+        # ----------------------------
+        # Inference profiling
+        # ----------------------------
+        config = GenerationConfig(max_output_tokens=args.max_out, temperature=0.3, top_p=1)
         pipeline = QuestionGenerationPipeline(adapter=adapter, config=config)
-        
-        # Generate questions
-        print("🤖 Generating questions...")
-        print("   (This may take 30-60 seconds for the small model)\n")
-        
+
+        mem_before = read_process_memory(pid)
+        logger.write({
+            "event": "infer_start",
+            "pid": pid,
+            "rss_mb_before": mem_before.rss_mb,
+            "vms_mb_before": mem_before.vms_mb,
+            "uss_mb_before": mem_before.uss_mb,
+        })
+
+        stop = asyncio.Event()
+        sampler_task = asyncio.create_task(
+            sample_process_memory(pid, logger, stage="infer", interval_s=args.interval, stop_event=stop)
+        )
+
+        t_inf0 = time.perf_counter()
         result = await pipeline.generate_with_metrics(sample_article)
-        
-        # Display results
-        print("=" * 60)
-        print("RESULTS")
-        print("=" * 60)
-        
-        print(f"\n✓ Generated {len(result.questions)} questions")
-        print(f"\n📊 Metrics:")
-        print(f"   • Total latency: {result.metrics.latency_ms:.1f}ms")
-        print(f"   • Peak memory: {result.metrics.memory_peak_mb:.1f}MB")
-        print(f"   • Chunks created: {result.metrics.chunks_created}")
-        print(f"   • Candidates generated: {result.metrics.candidates_generated}")
-        print(f"   • Validation pass rate: {result.metrics.validation_pass_rate:.1%}")
-        print(f"   • Deduplication reduction: {result.metrics.deduplication_reduction:.1%}")
-        
-        print(f"\n📝 Questions:\n")
-        for i, q in enumerate(result.questions, 1):
-            print(f"{i}. {q.question}")
-        
-        print("=" * 60)
-        print("✓ Test completed successfully!")
-        print("=" * 60)
-        
+        t_inf1 = time.perf_counter()
+
+        stop.set()
+        infer_peak = await sampler_task
+
+        mem_after = read_process_memory(pid)
+        logger.write({
+            "event": "infer_end",
+            "pid": pid,
+            "infer_latency_ms": (t_inf1 - t_inf0) * 1000.0,
+            "rss_mb_after": mem_after.rss_mb,
+            "vms_mb_after": mem_after.vms_mb,
+            "uss_mb_after": mem_after.uss_mb,
+            "rss_delta_mb": mem_after.rss_mb - mem_before.rss_mb,
+            "vms_delta_mb": mem_after.vms_mb - mem_before.vms_mb,
+            "uss_delta_mb": (mem_after.uss_mb - mem_before.uss_mb) if (mem_after.uss_mb is not None and mem_before.uss_mb is not None) else None,
+            "infer_peaks": infer_peak,
+            "pipeline_metrics": {
+                "latency_ms": getattr(result.metrics, "latency_ms", None),
+                "memory_peak_mb": getattr(result.metrics, "memory_peak_mb", None),
+                "chunks_created": getattr(result.metrics, "chunks_created", None),
+                "candidates_generated": getattr(result.metrics, "candidates_generated", None),
+                "validation_pass_rate": getattr(result.metrics, "validation_pass_rate", None),
+                "deduplication_reduction": getattr(result.metrics, "deduplication_reduction", None),
+            },
+            "questions_count": len(result.questions),
+        })
+
+        print("\n✓ Done")
+        print(f"PID: {pid}")
+        print(f"Infer latency: {(t_inf1 - t_inf0) * 1000.0:.1f}ms")
+        print(f"RSS before/after: {mem_before.rss_mb:.1f}MB -> {mem_after.rss_mb:.1f}MB (Δ {mem_after.rss_mb - mem_before.rss_mb:.1f}MB)")
+        print(f"RSS peak during infer: {infer_peak['rss_peak_mb']:.1f}MB")
+        print(f"JSONL log: {args.out}")
+
         return 0
-        
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user")
-        return 130
-        
+
     except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-        
+        logger.write({"event": "error", "error": str(e)})
+        raise
     finally:
-        # Cleanup
-        if 'adapter' in locals():
-            print("\n🧹 Cleaning up...")
-            await adapter.shutdown()
-            print("✓ Server stopped")
+        if adapter is not None:
+            try:
+                await adapter.shutdown()
+            except Exception:
+                pass
+        logger.write({"event": "run_end"})
 
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    raise SystemExit(asyncio.run(main()))

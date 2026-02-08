@@ -6,6 +6,16 @@
 import { QuestionCandidate, QuestionType, QuestionStyle, InferenceErrorCause } from './pipeline_types.js';
 import { ModelInferenceError } from './errors.js';
 
+// Import memory profiler if available
+let profileInference = null;
+try {
+  const module = await import('./memory_profiler.js');
+  profileInference = module.profileInference;
+} catch (e) {
+  // Memory profiler not available, continue without it
+  console.log('Memory profiler not available, running without profiling');
+}
+
 // ============================================================================
 // Prompt Template
 // ============================================================================
@@ -14,11 +24,12 @@ export function buildPrompt(chunkText, numCandidates = 1, config = null) {
   return [
     {
       role: "system",
-      content: "You are a strict JSON generator. Output ONLY one JSON object and nothing else. {\"question\":\"Insert your question here...\"}"
+      content: "You are a question generator. Output one JSON object: {\"question\":\"Insert your question here...\"}"
     },
     {
       role: "user",
-      content: `Write ONE question from the given text.
+      content: `
+        Generate a question from the given text.
         Text:
         ${chunkText}
 
@@ -281,6 +292,16 @@ export function parseModelResponse(responseText, chunkId) {
 // ============================================================================
 
 export class ModelAdapter {
+  constructor() {
+    this.memoryProfiler = null;
+    this.enableProfiling = false;
+  }
+
+  setMemoryProfiler(profiler) {
+    this.memoryProfiler = profiler;
+    this.enableProfiling = profiler !== null;
+  }
+
   async generateQuestions(chunk, numCandidates, generationConfig) {
     throw new Error("generateQuestions() must be implemented by subclass");
   }
@@ -322,45 +343,59 @@ export class WebGPUAdapter extends ModelAdapter {
       );
     }
     
-    try {
-      // Build prompt
-      const messages = buildPrompt(chunk.text, numCandidates, generationConfig);
-      
-      console.log(`Generating for chunk ${chunk.chunkId}...`);
-      
-      // Call model
-      const result = await this.generator(messages, {
-        max_new_tokens: generationConfig.maxOutputTokens,
-        temperature: generationConfig.temperature,
-        top_p: generationConfig.topP,
-        do_sample: true
-      });
-      
-      // Extract response text
-      let responseText;
-      if (result && result[0] && result[0].generated_text) {
-        const messages = result[0].generated_text;
-        const lastMessage = messages[messages.length - 1];
-        responseText = lastMessage.content;
-      } else {
-        responseText = JSON.stringify(result);
+    // Inference function (wrapped for profiling)
+    const inferenceFunction = async () => {
+      try {
+        // Build prompt
+        const messages = buildPrompt(chunk.text, numCandidates, generationConfig);
+        
+        console.log(`Generating for chunk ${chunk.chunkId}...`);
+        
+        // Call model
+        const result = await this.generator(messages, {
+          max_new_tokens: generationConfig.maxOutputTokens,
+          temperature: generationConfig.temperature,
+          top_p: generationConfig.topP,
+          do_sample: true
+        });
+        
+        // Extract response text
+        let responseText;
+        if (result && result[0] && result[0].generated_text) {
+          const messages = result[0].generated_text;
+          const lastMessage = messages[messages.length - 1];
+          responseText = lastMessage.content;
+        } else {
+          responseText = JSON.stringify(result);
+        }
+        
+        // Parse response
+        const candidates = parseModelResponse(responseText, chunk.chunkId);
+        
+        return candidates;
+        
+      } catch (e) {
+        if (e instanceof ModelInferenceError) {
+          throw e;
+        }
+        
+        throw new ModelInferenceError(
+          `Generation failed: ${e.message}`,
+          InferenceErrorCause.UNKNOWN,
+          chunk.chunkId
+        );
       }
-      
-      // Parse response
-      const candidates = parseModelResponse(responseText, chunk.chunkId);
-      
-      return candidates;
-      
-    } catch (e) {
-      if (e instanceof ModelInferenceError) {
-        throw e;
-      }
-      
-      throw new ModelInferenceError(
-        `Generation failed: ${e.message}`,
-        InferenceErrorCause.UNKNOWN,
-        chunk.chunkId
+    };
+    
+    // Execute with or without profiling
+    if (this.enableProfiling && this.memoryProfiler && profileInference) {
+      return await profileInference(
+        inferenceFunction,
+        chunk.chunkId,
+        this.memoryProfiler
       );
+    } else {
+      return await inferenceFunction();
     }
   }
   

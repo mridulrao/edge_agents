@@ -8,8 +8,8 @@ from typing import List, Optional, Dict
 import json
 import re
 
-from src.pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType, QuestionStyle
-from src.errors import ModelInferenceError, InferenceErrorCause
+from local_llm.pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType, QuestionStyle
+from local_llm.errors import ModelInferenceError, InferenceErrorCause
 
 
 # ============================================================================
@@ -80,18 +80,27 @@ def build_prompt(chunk_text: str, num_candidates: int = 1, config: GenerationCon
         {
             "role": "system",
             "content": (
-                "You are a strict JSON generator. Output ONLY one JSON object and nothing else. {\"question\":\"Insert your question here...\"}"
-            )
+                "You generate ONE question and output ONLY valid JSON.\n"
+                "Do not include explanations, markdown, or extra text.\n"
+                "Schema:\n"
+                '{"question":"..."}\n\n'
+                "Rules:\n"
+                "- Do NOT mention 'the text', 'this passage', 'given context', or similar phrases.\n"
+                "- Do NOT ask questions about the text itself (e.g., purpose, structure, wording).\n"
+                "- Ask a natural question a human would ask after reading the content.\n"
+                "- Use specific concepts, entities, or actions from the content.\n"
+                "- The question must be one clear sentence ending with '?'."
+            ),
         },
         {
             "role": "user",
             "content": (
-                "Write ONE question from the given text.\n\n"
-                "Text:\n"
+                "Read the content and ask ONE question about it.\n\n"
+                "CONTENT:\n"
                 f"{chunk_text}\n\n"
-                "Return JSON now like this - {'question':'Insert your question here...'}"
-            )
-        }
+                "Return ONLY the JSON object."
+            ),
+        },
     ]
 
 
@@ -136,23 +145,20 @@ def format_chat_prompt(
     
     return formatted
 
-
 # ============================================================================
 # Response Parsing - Robust Version with Multiple Strategies
 # ============================================================================
+
 def _extract_first_json_object(s: str) -> str | None:
     """
     Extract the first complete JSON object from a string using balanced-brace scanning.
 
-    Improvements vs previous version:
-    - Ignores braces that occur inside JSON strings
-    - Handles escaped quotes and escaped backslashes correctly
-    - Skips leading whitespace/non-json text robustly
+    - Ignores braces inside JSON strings
+    - Handles escaped quotes and escaped backslashes
     """
     if not s:
         return None
 
-    # Find the first '{'
     start = s.find("{")
     if start == -1:
         return None
@@ -175,7 +181,6 @@ def _extract_first_json_object(s: str) -> str | None:
                 in_str = False
             continue
 
-        # not in string
         if c == '"':
             in_str = True
             continue
@@ -188,12 +193,43 @@ def _extract_first_json_object(s: str) -> str | None:
             depth -= 1
             if depth == 0:
                 return s[start : i + 1]
-            # If depth goes negative, we had an unmatched '}' (garbage) -> abort
             if depth < 0:
                 return None
 
-    # Unterminated object
     return None
+
+
+def _repair_json_like_text(s: str) -> str:
+    """
+    Best-effort repair for common small-model JSON glitches.
+    Intentionally conservative: only fixes patterns that commonly appear at the END
+    of a JSON string value right before the closing brace.
+    """
+    t = (s or "").strip()
+    if not t:
+        return t
+
+    # Normalize “smart quotes”
+    t = t.replace("“", '"').replace("”", '"').replace("’", "'")
+
+    # If the model outputs: ...?\\"}  (stray escaped quote right before })
+    # Example: {"question":"...?\\"}
+    t = re.sub(r'\\+"(\s*})$', r'"\1', t)   # \\"} -> "}
+
+    # If the model outputs: ...?""}  (double-quote glitch)
+    # Example: {"question":"...?""}
+    t = re.sub(r'""(\s*})$', r'"\1', t)     # ""} -> "}
+
+    # More general: if it ends with an extra quote right before }
+    # Example: {"question":"...?"}
+    # (already fine) — but if it is {"question":"...?" "}
+    t = re.sub(r'"\s*"\s*}', r'"}', t)
+
+    # Very last-resort: if there is a trailing backslash before a closing quote at end
+    # Example: {"question":"...?\\"} -> {"question":"...?"}
+    t = re.sub(r'\\("(\s*})$)', r'\1', t)
+
+    return t
 
 
 def parse_model_response(
@@ -216,30 +252,29 @@ def parse_model_response(
     original_text = response_text
     cleaned = (response_text or "").strip()
 
-    # Remove markdown code fences (more robust than startswith/endswith)
-    # e.g. ```json ... ``` or ``` ... ```
+    # Remove markdown code fences
     cleaned = re.sub(r"^\s*```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```\s*$", "", cleaned)
     cleaned = cleaned.strip()
 
+    # ✅ NEW: repair common JSON glitches before parsing attempts
+    cleaned = _repair_json_like_text(cleaned)
+
     data: dict | None = None
 
-    # Strategy 1: direct JSON parse (fast path)
+    # Strategy 1: direct JSON parse
     try:
-        print("*****************************")
-        print(f"Original response text: {original_text}")
-        print(f"Cleaned response text: {cleaned}")
-        print("*****************************")
         data0 = json.loads(cleaned)
         if isinstance(data0, dict):
             data = data0
     except Exception:
         pass
 
-    # Strategy 2: balanced-brace extraction of first JSON object
+    # Strategy 2: balanced-brace extraction
     if data is None:
         obj = _extract_first_json_object(cleaned)
         if obj:
+            obj = _repair_json_like_text(obj)  # ✅ repair extracted object too
             try:
                 data0 = json.loads(obj)
                 if isinstance(data0, dict):
@@ -247,17 +282,17 @@ def parse_model_response(
             except Exception:
                 pass
 
-    # Strategy 3: legacy regex extraction (kept as a backstop)
+    # Strategy 3: regex extraction backstop
     if data is None:
-        # Try to find {"question": "..."} or {"questions": [...]}
         json_match = re.search(
             r'\{[\s\S]*?"(?:question|questions)"[\s\S]*?\}',
             cleaned,
             flags=re.IGNORECASE
         )
         if json_match:
+            candidate = _repair_json_like_text(json_match.group(0))  # ✅ repair
             try:
-                data0 = json.loads(json_match.group(0))
+                data0 = json.loads(candidate)
                 if isinstance(data0, dict):
                     data = data0
             except Exception:
@@ -279,9 +314,8 @@ def parse_model_response(
         question_patterns = [
             r'Question:\s*(.+?)(?:\n|$)',
             r'Q:\s*(.+?)(?:\n|$)',
-            r'(?:^|\n)([A-Z][^.!?]*\?)',  # sentence ending with ?
+            r'(?:^|\n)([A-Z][^.!?]*\?)',
         ]
-        
         for pattern in question_patterns:
             match = re.search(pattern, cleaned, re.MULTILINE | re.IGNORECASE)
             if match:
@@ -346,7 +380,6 @@ def parse_model_response(
             if isinstance(q, str):
                 question_text = q.strip()
             elif isinstance(q, dict):
-                # tolerate dict items in list
                 question_text = (
                     q.get("question") or
                     q.get("text") or
@@ -359,9 +392,7 @@ def parse_model_response(
             if not question_text:
                 continue
 
-            # Normalize: ensure it ends with '?'
             if not question_text.endswith("?"):
-                # Avoid "??"
                 question_text = question_text.rstrip() + "?"
 
             candidates.append(
@@ -373,8 +404,7 @@ def parse_model_response(
                     style=QuestionStyle.INTERROGATIVE,
                 )
             )
-        except Exception as e:
-            print(f"Warning: Skipped malformed question {i}: {e}")
+        except Exception:
             continue
 
     if not candidates:
@@ -384,10 +414,7 @@ def parse_model_response(
             chunk_id=chunk_id
         )
 
-    # Enforce "always 1" question contract at adapter boundary
-    # (keeps downstream deterministic even if model returns multiple)
     return candidates[:1]
-
 
 # ============================================================================
 # Mock Adapter (for testing)

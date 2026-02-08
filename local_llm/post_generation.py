@@ -4,7 +4,7 @@ Minimal validation, no evidence checking
 """
 
 from typing import List
-from src.pipeline_types import (
+from local_llm.pipeline_types import (
     QuestionCandidate,
     ValidationResult,
     RejectedCandidate,

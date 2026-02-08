@@ -200,6 +200,13 @@ class PipelineMetrics:
     candidates_deduplicated: int
     latency_ms: float
     memory_peak_mb: float
+    python_heap_peak_mb: float | None = None
+    server_pid: int | None = None
+    server_rss_before_mb: float | None = None
+    server_rss_after_mb: float | None = None
+    server_rss_peak_mb: float | None = None
+    server_rss_delta_mb: float | None = None
+
     
     # Optional detailed metrics
     validation_pass_rate: float = 0.0

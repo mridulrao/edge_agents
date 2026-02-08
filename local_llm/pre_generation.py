@@ -5,8 +5,8 @@ Optimized chunking for small models with buffer strategy
 
 import re
 from typing import List, Tuple
-from src.pipeline_types import ArticleInput, Chunk
-from src.errors import ChunkingError
+from local_llm.pipeline_types import ArticleInput, Chunk
+from local_llm.errors import ChunkingError
 
 
 # ============================================================================
