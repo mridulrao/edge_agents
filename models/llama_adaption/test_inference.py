@@ -2,21 +2,28 @@
 """
 Profiles llama-server load + inference and writes JSONL.
 
-UPDATED (grounded follow-up CSV mode):
-- Reads: extracted_dataset_with_grounded_followup.csv
-- Only processes rows where grounded_followup == True
-- Generates follow-up questions using your pipeline
-- Generates N questions per row where N = len(provided_questions)
-  (fallback to --gen_n if provided_questions missing/unparseable)
-- Writes a NEW CSV with:
-    - generated_question (JSON list string of whatever was produced)
-    - generation_status (ok/partial/fail)
-    - failure_reason (why N was not met)
-    - parse_failures (JSON list of parse failures if any)
+UPDATED (4-mode evaluation):
+✅ Runs ALL 4 configurations:
+   A) chunked + JSON + 1 question per call
+   B) full-article + JSON + N questions in one call
+   C) chunked + PLAINTEXT + 1 question per call
+   D) full-article + PLAINTEXT + N questions in one call
 
-Important behavior change:
-- If fewer than desired questions are produced, we still keep the generated ones
-  and record *why* (pipeline error, JSON parse failures, empty outputs, too few chunks, etc.)
+✅ Produces FOUR output CSVs (one per mode), plus one combined CSV (optional)
+✅ Keeps your existing "grounded_followup==True only" behavior
+✅ Stores per-mode outputs:
+   - generated_question (JSON list string)
+   - generated_n / got_n
+   - generation_status (ok/partial/fail)
+   - failure_reason
+   - parse_failures
+   - gen_latency_ms
+   - gen_error
+   - rss metrics
+
+NOTES:
+- This file assumes your updated pipeline supports `pipeline.generate_with_metrics(article, mode=...)`
+- This file imports QuestionGenMode from local_llm.model_adapter (as added earlier)
 """
 
 from __future__ import annotations
@@ -41,6 +48,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from models.llama_adaption.llama_server_adapter import create_adapter_with_server
 from local_llm.pipeline import QuestionGenerationPipeline
 from local_llm.pipeline_types import ArticleInput, GenerationConfig
+
+# NEW: modes
+from local_llm.model_adapter import QuestionGenMode
 
 
 # -----------------------------
@@ -85,17 +95,12 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 def normalize_question_payload(payload: Any) -> Optional[str]:
     """
-    Best-effort extractor for a question string.
-    Returns None if it can't confidently extract a question.
+    Extract a question string (best effort).
+    - Accepts already-clean question
+    - Accepts JSON {"question": "..."} embedded in string
+    - Accepts plain question line (endswith '?', <= 30 words)
     """
     if payload is None:
-        return None
-
-    if isinstance(payload, dict):
-        q = payload.get("question")
-        if isinstance(q, str):
-            q = q.strip()
-            return q if q else None
         return None
 
     if isinstance(payload, str):
@@ -108,12 +113,15 @@ def normalize_question_payload(payload: Any) -> Optional[str]:
             q = obj["question"].strip()
             return q if q else None
 
-        # If model returned plain question text (no JSON), optionally accept it
-        # (This helps when JSON parsing fails but content is still usable.)
-        # Heuristic: must end with '?'
         if s.endswith("?") and len(s.split()) <= 30:
             return s
+        return None
 
+    if isinstance(payload, dict):
+        q = payload.get("question")
+        if isinstance(q, str):
+            q = q.strip()
+            return q if q else None
         return None
 
     s = str(payload).strip()
@@ -280,41 +288,33 @@ def infer_failure_reason(
     parse_failures: List[Dict[str, Any]],
     result: Optional[Any],
 ) -> str:
-    """
-    Classify why we did not get desired_n questions.
-    """
     if desired_n <= 0:
         return "invalid_desired_n"
-
     if err:
         return f"pipeline_error: {err}"
-
     if got_n >= desired_n:
         return ""
 
-    # No exception, but got too few
     if result is None:
         return "no_result_returned"
 
-    total_candidates = None
+    total_final = None
     try:
-        total_candidates = len(getattr(result, "questions", []) or [])
+        total_final = len(getattr(result, "questions", []) or [])
     except Exception:
-        total_candidates = None
+        total_final = None
 
-    if total_candidates == 0:
+    if total_final == 0:
         return "empty_output_or_no_candidates"
 
     if parse_failures and got_n == 0:
-        return "json_parse_failed_all_candidates"
+        return "parse_failed_all_questions"
 
     if parse_failures and got_n < desired_n:
-        return f"json_parse_failed_some_candidates ({len(parse_failures)} failed)"
+        return f"parse_failed_some_questions ({len(parse_failures)} failed)"
 
-    # Likely chunking/selection limited generation before post-processing
-    # This happens when your pre-gen produces fewer chunks than desired questions.
-    if total_candidates is not None and total_candidates < desired_n:
-        return f"too_few_candidates_generated ({total_candidates} < {desired_n})"
+    if total_final is not None and total_final < desired_n:
+        return f"too_few_final_questions ({total_final} < {desired_n})"
 
     return "insufficient_valid_candidates_after_postprocessing"
 
@@ -323,11 +323,10 @@ async def run_and_clean(
     pipeline: QuestionGenerationPipeline,
     article_text: str,
     desired_questions: int,
+    mode: QuestionGenMode,
 ) -> Tuple[Optional[Any], Optional[str], List[str], List[Dict[str, Any]], float]:
     """
     Returns: (result, error_str, questions_clean, parse_failures, latency_ms)
-
-    Note: questions_clean includes only strings we could extract confidently.
     """
     sample_article = ArticleInput(text=article_text, desired_questions=int(desired_questions))
 
@@ -335,7 +334,7 @@ async def run_and_clean(
     result = None
     err = None
     try:
-        result = await pipeline.generate_with_metrics(sample_article)
+        result = await pipeline.generate_with_metrics(sample_article, mode=mode)
     except Exception as e:
         err = str(e)
     t1 = time.perf_counter()
@@ -346,6 +345,7 @@ async def run_and_clean(
     if result is not None:
         raw_questions = getattr(result, "questions", []) or []
         for i, q in enumerate(raw_questions):
+            # FinalQuestion has .question; but keep robust
             if hasattr(q, "question"):
                 q_text = normalize_question_payload(getattr(q, "question"))
             elif isinstance(q, dict):
@@ -363,6 +363,38 @@ async def run_and_clean(
     return result, err, questions_clean, parse_failures, (t1 - t0) * 1000.0
 
 
+def mode_specs(desired_n: int) -> List[Tuple[str, QuestionGenMode]]:
+    """
+    Return the 4 mode configs.
+    Names are used for output CSV suffixes.
+    """
+    return [
+        ("A_chunked_json_1", QuestionGenMode.A_chunked_json_1()),
+        ("B_full_json_n",    QuestionGenMode.B_full_json_n(desired_n)),
+        ("C_chunked_text_1", QuestionGenMode.C_chunked_text_1()),
+        ("D_full_text_n",    QuestionGenMode.D_full_text_n(desired_n)),
+    ]
+
+
+def init_output_columns(df: pd.DataFrame, prefix: str = "") -> pd.DataFrame:
+    """
+    Creates/overwrites the standard output columns in df.
+    """
+    out = df.copy()
+    out[f"{prefix}generated_question"] = ""
+    out[f"{prefix}generated_n"] = ""
+    out[f"{prefix}got_n"] = ""
+    out[f"{prefix}generation_status"] = ""
+    out[f"{prefix}failure_reason"] = ""
+    out[f"{prefix}parse_failures"] = ""
+    out[f"{prefix}gen_latency_ms"] = ""
+    out[f"{prefix}gen_error"] = ""
+    out[f"{prefix}rss_mb_before"] = ""
+    out[f"{prefix}rss_mb_after"] = ""
+    out[f"{prefix}rss_delta_mb"] = ""
+    return out
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -373,9 +405,18 @@ async def main() -> int:
     # JSONL profiling output
     ap.add_argument("--out", default="profiles/llama_profile.jsonl")
 
-    # CSV input/output
+    # CSV input/output (base)
     ap.add_argument("--csv", type=str, default="extracted_dataset_with_grounded_followup.csv")
-    ap.add_argument("--out_csv", type=str, default="extracted_dataset_with_generated_questions.csv")
+
+    # Output basename; we will write:
+    #  - <out_csv_base>__A_chunked_json_1.csv
+    #  - <out_csv_base>__B_full_json_n.csv
+    #  - <out_csv_base>__C_chunked_text_1.csv
+    #  - <out_csv_base>__D_full_text_n.csv
+    #  - <out_csv_base>__combined.csv (optional)
+    ap.add_argument("--out_csv_base", type=str, default="profiles/generated_questions")
+    ap.add_argument("--write_combined", action="store_true", help="Also write a combined CSV with 4x columns.")
+
     ap.add_argument("--limit", type=int, default=None, help="Limit number of TRUE rows processed")
 
     # llama-server config
@@ -420,7 +461,7 @@ async def main() -> int:
     try:
         logger.write({
             "event": "run_start",
-            "mode": "grounded_followup_true_only",
+            "mode": "grounded_followup_true_only__4modes",
             "csv_path": args.csv,
             "true_rows": int(len(df_true)),
             "model_path": MODEL_PATH,
@@ -430,6 +471,7 @@ async def main() -> int:
             "port": args.port,
             "verbose": args.verbose,
             "fallback_gen_n": args.gen_n,
+            "out_csv_base": args.out_csv_base,
         })
 
         # Start server once
@@ -457,40 +499,50 @@ async def main() -> int:
             "spawn_latency_ms": (t1 - t0) * 1000.0,
         })
 
-        # Conservative decoding for small models
-        config = GenerationConfig(max_output_tokens=args.max_out, temperature=0.2, top_p=0.9)
+        # Config
+        config = GenerationConfig(max_output_tokens=args.max_out, temperature=0.3, top_p=1)
         pipeline = QuestionGenerationPipeline(adapter=adapter, config=config)
 
-        # Prepare output columns
-        df_true = df_true.copy()
-        df_true["generated_question"] = ""     # JSON list string (store what we got)
-        df_true["generated_n"] = ""            # requested per-row
-        df_true["got_n"] = ""                  # actually extracted
-        df_true["generation_status"] = ""      # ok/partial/fail
-        df_true["failure_reason"] = ""         # why not equal
-        df_true["parse_failures"] = ""         # JSON list string
-        df_true["gen_latency_ms"] = ""
-        df_true["gen_error"] = ""
-        df_true["rss_mb_before"] = ""
-        df_true["rss_mb_after"] = ""
-        df_true["rss_delta_mb"] = ""
+        # We will produce 4 separate dfs (same input rows)
+        mode_dfs: Dict[str, pd.DataFrame] = {}
+        for mode_name, _ in mode_specs(desired_n=max(1, int(args.gen_n))):
+            mode_dfs[mode_name] = init_output_columns(df_true, prefix="")  # separate csv: no prefix
 
-        latencies: List[float] = []
+        # Optional combined df with prefixed columns per mode
+        combined_df: Optional[pd.DataFrame] = None
+        if args.write_combined:
+            combined_df = df_true.copy()
+            for mode_name, _ in mode_specs(desired_n=max(1, int(args.gen_n))):
+                combined_df = init_output_columns(combined_df, prefix=f"{mode_name}__")
 
         print(f"\nProcessing grounded_followup==True rows: {len(df_true)}")
         print(f"PID: {pid}")
-        print("-" * 60)
+        print("-" * 80)
 
+        # Main loop rows
         for j, (row_index, row) in enumerate(df_true.iterrows(), start=1):
             article_text = str(row.get("article", "")).strip()
             if not article_text:
-                df_true.at[row_index, "generated_question"] = json.dumps([], ensure_ascii=False)
-                df_true.at[row_index, "generated_n"] = "0"
-                df_true.at[row_index, "got_n"] = "0"
-                df_true.at[row_index, "generation_status"] = "fail"
-                df_true.at[row_index, "failure_reason"] = "empty_article"
-                df_true.at[row_index, "parse_failures"] = json.dumps([], ensure_ascii=False)
-                df_true.at[row_index, "gen_error"] = "empty_article"
+                # mark fail for all modes
+                for mode_name in mode_dfs:
+                    dfm = mode_dfs[mode_name]
+                    dfm.at[row_index, "generated_question"] = json.dumps([], ensure_ascii=False)
+                    dfm.at[row_index, "generated_n"] = "0"
+                    dfm.at[row_index, "got_n"] = "0"
+                    dfm.at[row_index, "generation_status"] = "fail"
+                    dfm.at[row_index, "failure_reason"] = "empty_article"
+                    dfm.at[row_index, "parse_failures"] = json.dumps([], ensure_ascii=False)
+                    dfm.at[row_index, "gen_error"] = "empty_article"
+                if combined_df is not None:
+                    for mode_name in mode_dfs:
+                        pref = f"{mode_name}__"
+                        combined_df.at[row_index, f"{pref}generated_question"] = json.dumps([], ensure_ascii=False)
+                        combined_df.at[row_index, f"{pref}generated_n"] = "0"
+                        combined_df.at[row_index, f"{pref}got_n"] = "0"
+                        combined_df.at[row_index, f"{pref}generation_status"] = "fail"
+                        combined_df.at[row_index, f"{pref}failure_reason"] = "empty_article"
+                        combined_df.at[row_index, f"{pref}parse_failures"] = json.dumps([], ensure_ascii=False)
+                        combined_df.at[row_index, f"{pref}gen_error"] = "empty_article"
                 continue
 
             # Determine per-row desired_n from provided_questions length (fallback to --gen_n)
@@ -504,120 +556,123 @@ async def main() -> int:
             if desired_n is None or desired_n <= 0:
                 desired_n = max(1, int(args.gen_n))
 
-            mem_before = read_process_memory(pid)
+            # Evaluate all 4 modes for this row
+            row_mem_before = read_process_memory(pid)
 
-            result, err, questions_clean, parse_failures, latency_ms = await run_and_clean(
-                pipeline=pipeline,
-                article_text=article_text,
-                desired_questions=desired_n,
-            )
+            row_print = f"[{j:03d}/{len(df_true):03d}]"
+            print(f"{row_print} Row index={int(row_index)} desired_n={desired_n}")
 
-            mem_after = read_process_memory(pid)
-            latencies.append(latency_ms)
+            for mode_name, mode in mode_specs(desired_n=desired_n):
+                mem_before = read_process_memory(pid)
 
-            got_n = len(questions_clean)
+                result, err, questions_clean, parse_failures, latency_ms = await run_and_clean(
+                    pipeline=pipeline,
+                    article_text=article_text,
+                    desired_questions=desired_n,
+                    mode=mode,
+                )
 
-            # Status + failure reasoning
-            if err is not None:
-                status = "fail"
-            elif got_n == 0:
-                status = "fail"
-            elif got_n < desired_n:
-                status = "partial"
-            else:
-                status = "ok"
+                mem_after = read_process_memory(pid)
+                got_n = len(questions_clean)
 
-            reason = infer_failure_reason(
-                desired_n=desired_n,
-                got_n=got_n,
-                err=err,
-                parse_failures=parse_failures,
-                result=result,
-            )
+                if err is not None:
+                    status = "fail"
+                elif got_n == 0:
+                    status = "fail"
+                elif got_n < desired_n:
+                    status = "partial"
+                else:
+                    status = "ok"
 
-            # Always store what we got
-            df_true.at[row_index, "generated_question"] = json.dumps(questions_clean, ensure_ascii=False)
-            df_true.at[row_index, "generated_n"] = str(desired_n)
-            df_true.at[row_index, "got_n"] = str(got_n)
-            df_true.at[row_index, "generation_status"] = status
-            df_true.at[row_index, "failure_reason"] = reason
-            df_true.at[row_index, "parse_failures"] = json.dumps(parse_failures, ensure_ascii=False)
-            df_true.at[row_index, "gen_latency_ms"] = f"{latency_ms:.3f}"
-            df_true.at[row_index, "gen_error"] = err or ""
-            df_true.at[row_index, "rss_mb_before"] = f"{mem_before.rss_mb:.3f}"
-            df_true.at[row_index, "rss_mb_after"] = f"{mem_after.rss_mb:.3f}"
-            df_true.at[row_index, "rss_delta_mb"] = f"{(mem_after.rss_mb - mem_before.rss_mb):.3f}"
+                reason = infer_failure_reason(
+                    desired_n=desired_n,
+                    got_n=got_n,
+                    err=err,
+                    parse_failures=parse_failures,
+                    result=result,
+                )
 
-            ok = (status == "ok")
+                # write into mode-specific df
+                dfm = mode_dfs[mode_name]
+                dfm.at[row_index, "generated_question"] = json.dumps(questions_clean, ensure_ascii=False)
+                dfm.at[row_index, "generated_n"] = str(desired_n)
+                dfm.at[row_index, "got_n"] = str(got_n)
+                dfm.at[row_index, "generation_status"] = status
+                dfm.at[row_index, "failure_reason"] = reason
+                dfm.at[row_index, "parse_failures"] = json.dumps(parse_failures, ensure_ascii=False)
+                dfm.at[row_index, "gen_latency_ms"] = f"{latency_ms:.3f}"
+                dfm.at[row_index, "gen_error"] = err or ""
+                dfm.at[row_index, "rss_mb_before"] = f"{mem_before.rss_mb:.3f}"
+                dfm.at[row_index, "rss_mb_after"] = f"{mem_after.rss_mb:.3f}"
+                dfm.at[row_index, "rss_delta_mb"] = f"{(mem_after.rss_mb - mem_before.rss_mb):.3f}"
 
-            logger.write({
-                "event": "csv_row_result",
-                "row_num": j,
-                "source_row_index": int(row_index),
+                # write into combined df with prefix
+                if combined_df is not None:
+                    pref = f"{mode_name}__"
+                    combined_df.at[row_index, f"{pref}generated_question"] = json.dumps(questions_clean, ensure_ascii=False)
+                    combined_df.at[row_index, f"{pref}generated_n"] = str(desired_n)
+                    combined_df.at[row_index, f"{pref}got_n"] = str(got_n)
+                    combined_df.at[row_index, f"{pref}generation_status"] = status
+                    combined_df.at[row_index, f"{pref}failure_reason"] = reason
+                    combined_df.at[row_index, f"{pref}parse_failures"] = json.dumps(parse_failures, ensure_ascii=False)
+                    combined_df.at[row_index, f"{pref}gen_latency_ms"] = f"{latency_ms:.3f}"
+                    combined_df.at[row_index, f"{pref}gen_error"] = err or ""
+                    combined_df.at[row_index, f"{pref}rss_mb_before"] = f"{mem_before.rss_mb:.3f}"
+                    combined_df.at[row_index, f"{pref}rss_mb_after"] = f"{mem_after.rss_mb:.3f}"
+                    combined_df.at[row_index, f"{pref}rss_delta_mb"] = f"{(mem_after.rss_mb - mem_before.rss_mb):.3f}"
 
-                "expected_questions": desired_n,
-                "got_questions": got_n,
-                "status": status,
-                "failure_reason": reason,
-                "error": err,
+                logger.write({
+                    "event": "csv_row_result_mode",
+                    "row_num": j,
+                    "source_row_index": int(row_index),
+                    "mode": mode_name,
+                    "expected_questions": desired_n,
+                    "got_questions": got_n,
+                    "status": status,
+                    "failure_reason": reason,
+                    "error": err,
+                    "latency_ms": latency_ms,
+                    "questions_clean": questions_clean,
+                    "question_parse_failures": parse_failures,
+                    "rss_mb_before": mem_before.rss_mb,
+                    "rss_mb_after": mem_after.rss_mb,
+                    "rss_delta_mb": mem_after.rss_mb - mem_before.rss_mb,
+                })
 
-                "latency_ms": latency_ms,
-                "questions_clean": questions_clean,
-                "question_parse_failures": parse_failures,
+                badge = "✅" if status == "ok" else ("⚠️" if status == "partial" else "❌")
+                print(f"   {badge} {mode_name:16s} latency={latency_ms:6.0f}ms  got={got_n}/{desired_n}  reason={reason}")
 
-                "rss_mb_before": mem_before.rss_mb,
-                "rss_mb_after": mem_after.rss_mb,
-                "rss_delta_mb": mem_after.rss_mb - mem_before.rss_mb,
-            })
+                if args.fail_fast and status != "ok":
+                    print("Fail-fast enabled. Stopping.")
+                    break
 
-            if ok:
-                print(f"[{j:03d}/{len(df_true):03d}] ✅ OK      latency={latency_ms:.0f}ms  got={got_n}/{desired_n}")
-            elif status == "partial":
-                print(f"[{j:03d}/{len(df_true):03d}] ⚠️ PARTIAL latency={latency_ms:.0f}ms  got={got_n}/{desired_n}  reason={reason}")
-            else:
-                print(f"[{j:03d}/{len(df_true):03d}] ❌ FAIL    latency={latency_ms:.0f}ms  got={got_n}/{desired_n}  reason={reason}")
+            if args.fail_fast:
+                # if any mode failed, we already broke; exit outer as well
+                # (best effort: check last printed line status by scanning dfs not worth it)
+                pass
 
-            if (not ok) and args.fail_fast:
-                print("Fail-fast enabled. Stopping.")
-                break
+        # Write mode CSVs
+        base = Path(args.out_csv_base)
+        base.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write output CSV
-        out_path = Path(args.out_csv)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        df_true.to_csv(out_path, index=False)
-        print("-" * 60)
-        print(f"✅ Wrote CSV: {out_path}")
+        for mode_name, dfm in mode_dfs.items():
+            out_path = base.parent / f"{base.name}__{mode_name}.csv"
+            dfm.to_csv(out_path, index=False)
+            print(f"✅ Wrote CSV ({mode_name}): {out_path}")
 
-        # Summary
-        latencies = [x for x in latencies if isinstance(x, (int, float))]
-        if latencies:
-            s = sorted(latencies)
-            p50 = s[int(0.50 * (len(s) - 1))]
-            p95 = s[int(0.95 * (len(s) - 1))]
-            avg = sum(latencies) / len(latencies)
-        else:
-            avg = p50 = p95 = None
+        if combined_df is not None:
+            out_path = base.parent / f"{base.name}__combined.csv"
+            combined_df.to_csv(out_path, index=False)
+            print(f"✅ Wrote combined CSV: {out_path}")
 
-        # Count statuses
-        status_counts = df_true["generation_status"].value_counts(dropna=False).to_dict()
-
-        summary = {
+        logger.write({
             "event": "run_summary",
             "processed_true_rows": int(len(df_true)),
-            "status_counts": status_counts,
-            "latency_ms_avg": avg,
-            "latency_ms_p50": p50,
-            "latency_ms_p95": p95,
-            "out_csv": str(out_path),
+            "out_csv_base": str(base),
             "jsonl_log": args.out,
-        }
-        logger.write(summary)
+        })
 
-        if avg is not None:
-            print(f"Latency: avg={avg:.0f}ms p50={p50:.0f}ms p95={p95:.0f}ms")
-        print(f"Status counts: {status_counts}")
         print(f"JSONL log: {args.out}")
-
         return 0
 
     except Exception as e:

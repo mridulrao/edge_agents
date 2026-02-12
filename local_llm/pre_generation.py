@@ -1,19 +1,30 @@
 """
 Edge Question Generation Pipeline - Pre-Generation
 
-UPDATED:
-✅ Guarantees at least `desired_questions` chunks (when the article has enough words)
-✅ Uses fixed-size chunks (~TARGET_CHUNK_WORDS)
-✅ If non-overlapping chunks are not enough, it switches to OVERLAPPING (sliding window)
-✅ Still supports buffer strategy (BUFFER_MULTIPLIER) for fault tolerance
-✅ Keeps chunks within [MIN_CHUNK_WORDS, MAX_CHUNK_WORDS] as best as possible
+UPDATED (for 4 configurations A/B/C/D):
+✅ Adds `chunk_article_for_mode(article, mode)`:
+   - CHUNKED modes (A/C): use your existing fixed/overlap chunking logic
+   - FULL_ARTICLE modes (B/D): return a single chunk containing the full (substantive) article text
+✅ Adds `calculate_required_chunks_for_mode(...)`:
+   - CHUNKED: keeps BUFFER_MULTIPLIER behavior
+   - FULL_ARTICLE: always 1
+✅ Adds `allocate_candidates_for_mode(...)`:
+   - CHUNKED: [1, 1, 1, ...]
+   - FULL_ARTICLE: [mode.questions_per_call] (one call yields N)
+✅ Keeps your existing functions intact as much as possible so minimal downstream breakage
 """
+
+from __future__ import annotations
 
 import re
 import math
 from typing import List, Tuple
+
 from local_llm.pipeline_types import ArticleInput, Chunk
 from local_llm.errors import ChunkingError
+
+# NEW: modes (from model_adapter.py)
+from local_llm.model_adapter import QuestionGenMode, GenerationScope
 
 
 # ============================================================================
@@ -81,7 +92,7 @@ def extract_substantive_content(text: str, word_count: int) -> Tuple[str, int, i
 
 
 # ============================================================================
-# Chunking Logic
+# Chunking Logic (existing)
 # ============================================================================
 
 def _word_start_char_positions(words: List[str]) -> Tuple[str, List[int]]:
@@ -110,8 +121,9 @@ def _natural_nonoverlap_chunks(total_words: int, window: int) -> int:
 
 def calculate_required_chunks(total_words: int, desired_questions: int) -> int:
     """
-    We want at least desired_questions, and optionally buffer.
-    The final count will still be capped later by what's possible.
+    CHUNKED target:
+    - want at least desired_questions
+    - plus buffer (BUFFER_MULTIPLIER)
     """
     desired_questions = max(1, int(desired_questions))
     target = max(desired_questions, int(math.ceil(desired_questions * BUFFER_MULTIPLIER)))
@@ -137,31 +149,22 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
     Create ~TARGET_CHUNK_WORDS chunks.
     If non-overlapping chunks are fewer than required_chunks and ALLOW_OVERLAP_TO_MEET_DESIRED,
     use a sliding window to reach required_chunks (bounded by what's possible).
-
-    Key guarantee:
-    - If there are enough words to support it, we will return >= desired_questions chunks.
     """
-
     words = text.split()
     total_words = len(words)
 
     if total_words < MIN_CHUNK_WORDS:
         return [Chunk(chunk_id=0, text=text, start_offset=0, end_offset=len(text))]
 
-    # Window size: clamp target into [MIN_CHUNK_WORDS, MAX_CHUNK_WORDS]
     window = max(MIN_CHUNK_WORDS, min(TARGET_CHUNK_WORDS, MAX_CHUNK_WORDS))
 
-    # If the text is shorter than window, single chunk.
     if total_words <= window:
         rebuilt, word_starts = _word_start_char_positions(words)
-        _ = rebuilt  # silence unused
+        _ = rebuilt
         return [_build_chunk(words, word_starts, (0, total_words), 0)]
 
-    # How many non-overlapping chunks would we naturally have?
     nonoverlap_n = _natural_nonoverlap_chunks(total_words, window)
 
-    # If enough with non-overlapping, do fixed chunking (fast + clean)
-    # BUT: We still respect required_chunks by truncating to required_chunks.
     if nonoverlap_n >= required_chunks or not ALLOW_OVERLAP_TO_MEET_DESIRED:
         spans: List[Tuple[int, int]] = []
         start = 0
@@ -170,7 +173,6 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
             spans.append((start, end))
             start = end
 
-        # Merge last if too small
         if len(spans) >= 2:
             last_s, last_e = spans[-1]
             if (last_e - last_s) < MIN_CHUNK_WORDS:
@@ -180,7 +182,6 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
 
         spans = spans[:max(1, required_chunks)]
 
-        # After truncation, merge last if too small
         if len(spans) >= 2:
             last_s, last_e = spans[-1]
             if (last_e - last_s) < MIN_CHUNK_WORDS:
@@ -192,23 +193,19 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
         _ = rebuilt
         return [_build_chunk(words, word_starts, sp, i) for i, sp in enumerate(spans)]
 
-    # Otherwise: need overlap to reach required_chunks
+    # Overlap
     max_possible = _max_windows(total_words, window)
     final_n = min(required_chunks, max_possible)
 
-    # Compute stride to fit final_n windows across the text:
-    # We need (final_n - 1) * stride <= (total_words - window)
-    # Choose the largest stride that still fits (more spread out, less redundant).
     available = total_words - window
     if final_n <= 1:
-        stride = available  # doesn't matter
+        stride = available
     else:
         stride = max(1, available // (final_n - 1))
 
     spans: List[Tuple[int, int]] = []
     start = 0
     for i in range(final_n):
-        # Ensure last window ends at the end of text to cover tail
         if i == final_n - 1:
             start = total_words - window
         end = start + window
@@ -217,16 +214,13 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
         if start > total_words - window:
             start = total_words - window
 
-    # Build chunks
     rebuilt, word_starts = _word_start_char_positions(words)
     _ = rebuilt
     chunks = [_build_chunk(words, word_starts, sp, i) for i, sp in enumerate(spans)]
 
-    # Safety: if last chunk somehow violates MIN_CHUNK_WORDS, merge backward
     if len(chunks) >= 2:
         last_words = len(chunks[-1].text.split())
         if last_words < MIN_CHUNK_WORDS:
-            # merge last into previous (text-level merge)
             prev = chunks[-2]
             last = chunks[-1]
             merged_text = (prev.text + " " + last.text).strip()
@@ -241,48 +235,90 @@ def create_chunks_fixed_or_overlap(text: str, required_chunks: int) -> List[Chun
     return chunks
 
 
-def chunk_article(article: ArticleInput) -> List[Chunk]:
-    """
-    Create chunks optimized for small-model single-question generation.
+# ============================================================================
+# NEW: Mode-aware chunking entrypoint
+# ============================================================================
 
-    Guarantees:
-    - Returns at least `desired_questions` chunks when possible (via overlap).
-    - Returns up to buffer target chunks when possible.
+def calculate_required_chunks_for_mode(total_words: int, desired_questions: int, mode: QuestionGenMode) -> int:
+    """
+    FULL_ARTICLE modes: always 1 chunk (one call)
+    CHUNKED modes: existing buffered behavior
+    """
+    if mode.scope == GenerationScope.FULL_ARTICLE:
+        return 1
+    return calculate_required_chunks(total_words, desired_questions)
+
+
+def chunk_article_for_mode(article: ArticleInput, mode: QuestionGenMode) -> List[Chunk]:
+    """
+    Mode-aware chunking.
+
+    - CHUNKED (A/C): return multiple chunks using fixed/overlap strategy.
+    - FULL_ARTICLE (B/D): return a single chunk containing full substantive text.
+      (Still applies normalization + optional intro/outro skipping for very long docs.)
     """
     normalized_text = normalize_text(article.text)
     if not normalized_text:
         raise ChunkingError("Article text is empty after normalization")
 
     total_word_count = count_words(normalized_text)
-
-    # Keep your original minimum check, but make it less arbitrary than 50 if you want:
-    # If your dataset has short articles, you can lower this to MIN_CHUNK_WORDS.
     if total_word_count < MIN_CHUNK_WORDS:
-        raise ChunkingError(f"Article too short: {total_word_count} words (minimum {MIN_CHUNK_WORDS})")
+        raise ChunkingError(
+            f"Article too short: {total_word_count} words (minimum {MIN_CHUNK_WORDS})"
+        )
 
-    text_to_chunk, _, _ = extract_substantive_content(normalized_text, total_word_count)
-    substantive_word_count = count_words(text_to_chunk)
+    text_to_use, _, _ = extract_substantive_content(normalized_text, total_word_count)
+    substantive_word_count = count_words(text_to_use)
 
     desired_q = max(1, int(article.desired_questions))
-    required_chunks = calculate_required_chunks(substantive_word_count, desired_q)
 
-    chunks = create_chunks_fixed_or_overlap(text_to_chunk, required_chunks)
+    if mode.scope == GenerationScope.FULL_ARTICLE:
+        # single chunk, preserve offsets roughly (0..len)
+        return [Chunk(chunk_id=0, text=text_to_use, start_offset=0, end_offset=len(text_to_use))]
+
+    # CHUNKED path (existing)
+    required_chunks = calculate_required_chunks_for_mode(substantive_word_count, desired_q, mode)
+    chunks = create_chunks_fixed_or_overlap(text_to_use, required_chunks)
 
     if not chunks:
         raise ChunkingError("Failed to create any chunks")
 
-    # If we still couldn't meet desired_questions, that's due to extremely short text.
-    # (At that point, even overlap can't make more meaningful windows.)
     return chunks
 
 
 # ============================================================================
-# Candidate Allocation
+# Candidate Allocation (mode-aware)
 # ============================================================================
+
+def allocate_candidates_for_mode(num_chunks: int, desired_questions: int, mode: QuestionGenMode) -> List[int]:
+    """
+    For CHUNKED modes: 1 question per chunk (stable)
+    For FULL_ARTICLE modes: single call produces N questions (mode.questions_per_call)
+    """
+    if mode.scope == GenerationScope.FULL_ARTICLE:
+        n = max(1, int(mode.questions_per_call))
+        return [n]
+
+    # CHUNKED
+    return [1] * max(1, int(num_chunks))
+
+
+# ============================================================================
+# Backwards-compatible API (existing names)
+# ============================================================================
+
+def chunk_article(article: ArticleInput) -> List[Chunk]:
+    """
+    Backwards-compatible: original behavior = CHUNKED JSON 1 (Config A).
+    """
+    # Avoid import cycle by constructing mode here
+    mode = QuestionGenMode.A_chunked_json_1()
+    return chunk_article_for_mode(article, mode)
+
 
 def allocate_candidates(num_chunks: int, desired_questions: int) -> List[int]:
     """
-    Always 1 question per chunk for stability on small models.
+    Backwards-compatible: original behavior = 1 question per chunk.
     """
     return [1] * max(1, int(num_chunks))
 
@@ -293,9 +329,15 @@ def allocate_candidates(num_chunks: int, desired_questions: int) -> List[int]:
 
 __all__ = [
     "normalize_text",
-    "chunk_article",
-    "allocate_candidates",
+    "count_words",
     "extract_substantive_content",
     "calculate_required_chunks",
     "create_chunks_fixed_or_overlap",
+    # mode-aware
+    "calculate_required_chunks_for_mode",
+    "chunk_article_for_mode",
+    "allocate_candidates_for_mode",
+    # old API
+    "chunk_article",
+    "allocate_candidates",
 ]

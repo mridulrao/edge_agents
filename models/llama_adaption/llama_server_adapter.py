@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
 """
-Edge Question Generation Pipeline - LlamaServer Adapter (Enhanced)
-Adapter for llama.cpp server with integrated server management
+Edge Question Generation Pipeline - LlamaServer Adapter (UPDATED)
+Mode-aware adapter for llama.cpp server with integrated server management.
 
-Supports:
-- Local server instances (development)
-- Remote deployments (production)
-- CPU / Metal / GPU backends (depending on llama-server build)
-- GGUF models (BF16/F16/Q4/Q5/Q8, etc.)
+Fixes:
+✅ Don't stringify chat-message lists into prompts (proper formatting for /v1/completions)
+✅ Correct build_prompt_for_mode(...) call signature (was passing args in wrong order)
+✅ Use messages list for /v1/chat/completions and formatted string for /v1/completions
+✅ Mode-aware prompt building + parsing (JSON vs PLAINTEXT, 1 vs N)
+✅ Prefer /v1/completions for determinism (no nested chat confusion)
+✅ Stop sequences disabled by default (prevents returning just '}' etc.)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Tuple
 
 import aiohttp
 
-from local_llm.model_adapter import ModelAdapter, parse_model_response, build_prompt
 from local_llm.pipeline_types import Chunk, QuestionCandidate, GenerationConfig
 from local_llm.errors import ModelInferenceError, InferenceErrorCause
 
 from models.llama_adaption.llama_server_manager import LlamaServerManager, ServerConfig
+
+# UPDATED imports (mode-aware)
+from local_llm.model_adapter import (
+    ModelAdapter,
+    QuestionGenMode,
+    build_prompt_for_mode,
+    parse_model_response_for_mode,
+    format_chat_prompt,  # ✅ FIX: needed to turn messages -> prompt string for /v1/completions
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,56 +41,15 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ============================================================================
 
-def _content_to_string(content: Any) -> str:
-    """
-    Normalize OpenAI-style "content parts" or arbitrary prompt payloads into a plain string.
-
-    llama-server /v1/chat/completions commonly supports ONLY:
-      messages: [{ role: "...", content: "<string>" }]
-
-    It often rejects:
-      content: [{type:"text", text:"..."}]  -> "unsupported content[].type"
-    """
-    if content is None:
-        return ""
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-            if isinstance(item, dict):
-                if item.get("type") == "text" and "text" in item:
-                    parts.append(str(item["text"]))
-                    continue
-                if "text" in item:
-                    parts.append(str(item["text"]))
-                    continue
-                parts.append(str(item))
-                continue
-            parts.append(str(item))
-        return "\n".join(p for p in parts if p is not None)
-
-    if isinstance(content, dict):
-        if content.get("type") == "text" and "text" in content:
-            return str(content["text"])
-        if "text" in content:
-            return str(content["text"])
-        return str(content)
-
-    return str(content)
-
-
 def _normalize_stop(stop: Any) -> Optional[List[str]]:
     """
     llama-server expects stop to be either:
       - omitted / null
       - a list of strings
       - sometimes a single string
+
+    NOTE: while debugging JSON/brace truncation issues, it's safer to return None.
+    We'll still keep this helper, but the adapter below defaults to disabling stop.
     """
     if stop is None:
         return None
@@ -92,17 +61,30 @@ def _normalize_stop(stop: Any) -> Optional[List[str]]:
         for x in stop:
             if x is None:
                 continue
-            if isinstance(x, str):
-                s = x.strip()
-                if s:
-                    out.append(s)
-            else:
-                s = str(x).strip()
-                if s:
-                    out.append(s)
+            s = (x if isinstance(x, str) else str(x)).strip()
+            if s:
+                out.append(s)
         return out or None
     s = str(stop).strip()
     return [s] if s else None
+
+
+def _extract_text_from_openai_like(result: dict) -> str:
+    """
+    Supports both:
+    - /v1/completions -> choices[0].text
+    - /v1/chat/completions -> choices[0].message.content
+    """
+    if "choices" not in result or not result["choices"]:
+        return ""
+    choice = result["choices"][0]
+    if isinstance(choice, dict):
+        if "text" in choice and isinstance(choice["text"], str):
+            return choice["text"]
+        if "message" in choice and isinstance(choice["message"], dict):
+            c = choice["message"].get("content", "")
+            return c if isinstance(c, str) else ""
+    return ""
 
 
 # ============================================================================
@@ -113,11 +95,9 @@ class LlamaServerAdapter(ModelAdapter):
     """
     Adapter for llama.cpp server (llama-server).
 
-    Can connect to existing server OR manage its own server instance.
-
     Uses OpenAI-compatible endpoints:
-      - /v1/chat/completions (preferred for instruct/chat models)
-      - /v1/completions (fallback)
+      - /v1/completions (preferred)
+      - /v1/chat/completions (fallback)
     """
 
     def __init__(
@@ -125,10 +105,12 @@ class LlamaServerAdapter(ModelAdapter):
         base_url: Optional[str] = None,
         server_manager: Optional["LlamaServerManager"] = None,
         timeout_seconds: float = 30.0,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        prefer_chat_endpoint: bool = True,
+        max_retries: int = 2,
+        retry_delay: float = 0.75,
+        prefer_completion_endpoint: bool = True,
         debug_log_prompts: bool = False,
+        debug_log_raw_response: bool = False,
+        disable_stop_sequences: bool = True,   # ✅ important for your current failures
     ):
         self.server_manager = server_manager
 
@@ -142,13 +124,14 @@ class LlamaServerAdapter(ModelAdapter):
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.prefer_chat_endpoint = prefer_chat_endpoint
+        self.prefer_completion_endpoint = prefer_completion_endpoint
         self.debug_log_prompts = debug_log_prompts
+        self.debug_log_raw_response = debug_log_raw_response
+        self.disable_stop_sequences = disable_stop_sequences
 
         self._ready = False
         self._session: Optional[aiohttp.ClientSession] = None
 
-    # NEW: convenience
     def get_server_pid(self) -> Optional[int]:
         return self.server_manager.pid if self.server_manager else None
 
@@ -182,33 +165,68 @@ class LlamaServerAdapter(ModelAdapter):
             self._ready = False
             return False
 
+    # ----------------------------------------------------------------------
+    # LEGACY API (kept for compatibility): A = chunked + JSON + 1
+    # ----------------------------------------------------------------------
     async def generate_questions(
         self,
         chunk: Chunk,
         num_candidates: int,
         generation_config: GenerationConfig,
     ) -> List[QuestionCandidate]:
+        mode = QuestionGenMode.A_chunked_json_1()
+        return await self.generate_questions_mode(
+            text=chunk.text,
+            chunk_id=chunk.chunk_id,
+            mode=mode,
+            generation_config=generation_config,
+        )
+
+    # ----------------------------------------------------------------------
+    # MODE-AWARE API used by updated pipeline
+    # ----------------------------------------------------------------------
+    async def generate_questions_mode(
+        self,
+        text: str,
+        chunk_id: int,
+        mode: QuestionGenMode,
+        generation_config: GenerationConfig,
+    ) -> List[QuestionCandidate]:
         await self._ensure_session()
 
-        prompt_obj = build_prompt(chunk.text, num_candidates, generation_config)
-        prompt_str = _content_to_string(prompt_obj)
+        if not (await self.is_ready()):
+            raise ModelInferenceError(
+                message="Server not ready",
+                cause=InferenceErrorCause.MODEL_NOT_READY,
+                chunk_id=chunk_id,
+            )
+
+        # ==================================================================
+        # ✅ FIX #1: Correct build_prompt_for_mode(...) signature
+        # Your build_prompt_for_mode returns a LIST OF CHAT MESSAGES.
+        # It expects: (text, desired_questions, mode, config)
+        # ==================================================================
+        messages = build_prompt_for_mode(
+            text=text,
+            desired_questions=mode.questions_per_call,
+            mode=mode,
+            config=generation_config,
+        )
+
+        # ==================================================================
+        # ✅ FIX #2: /v1/completions needs a STRING prompt, not messages list
+        # ==================================================================
+        prompt_str = format_chat_prompt(messages)
 
         if self.debug_log_prompts:
-            logger.info("build_prompt() returned type=%s", type(prompt_obj))
-            logger.info("prompt (first 500 chars): %s", prompt_str[:500])
+            logger.info("MODE=%s prompt(first 500)=%s", getattr(mode, "name", str(mode)), prompt_str[:500])
 
-        stop_list = _normalize_stop(getattr(generation_config, "stop_sequences", None))
+        # ✅ IMPORTANT: disable stop sequences while debugging JSON truncation
+        stop_list = None
+        if not self.disable_stop_sequences:
+            stop_list = _normalize_stop(getattr(generation_config, "stop_sequences", None))
 
-        chat_payload = {
-            "messages": [{"role": "user", "content": prompt_str}],
-            "temperature": generation_config.temperature,
-            "top_p": generation_config.top_p,
-            "max_tokens": generation_config.max_output_tokens,
-            "stream": False,
-        }
-        if stop_list:
-            chat_payload["stop"] = stop_list
-
+        # Prefer /v1/completions (more deterministic; no nested chat templates)
         completion_payload = {
             "prompt": prompt_str,
             "temperature": generation_config.temperature,
@@ -219,17 +237,28 @@ class LlamaServerAdapter(ModelAdapter):
         if stop_list:
             completion_payload["stop"] = stop_list
 
-        endpoints_to_try = []
-        if self.prefer_chat_endpoint:
-            endpoints_to_try.append((f"{self.base_url}/v1/chat/completions", chat_payload, "chat"))
-            endpoints_to_try.append((f"{self.base_url}/v1/completions", completion_payload, "completion"))
+        # ✅ /v1/chat/completions expects messages list (NOT a single user with prompt_str)
+        chat_payload = {
+            "messages": messages,
+            "temperature": generation_config.temperature,
+            "top_p": generation_config.top_p,
+            "max_tokens": generation_config.max_output_tokens,
+            "stream": False,
+        }
+        if stop_list:
+            chat_payload["stop"] = stop_list
+
+        endpoints: List[Tuple[str, dict, str]] = []
+        if self.prefer_completion_endpoint:
+            endpoints.append((f"{self.base_url}/v1/completions", completion_payload, "completion"))
+            endpoints.append((f"{self.base_url}/v1/chat/completions", chat_payload, "chat"))
         else:
-            endpoints_to_try.append((f"{self.base_url}/v1/completions", completion_payload, "completion"))
-            endpoints_to_try.append((f"{self.base_url}/v1/chat/completions", chat_payload, "chat"))
+            endpoints.append((f"{self.base_url}/v1/chat/completions", chat_payload, "chat"))
+            endpoints.append((f"{self.base_url}/v1/completions", completion_payload, "completion"))
 
         last_exception: Optional[Exception] = None
 
-        for endpoint, payload, mode in endpoints_to_try:
+        for endpoint, payload, api_mode in endpoints:
             for attempt in range(self.max_retries):
                 try:
                     async with self._session.post(
@@ -242,12 +271,13 @@ class LlamaServerAdapter(ModelAdapter):
                             err = ModelInferenceError(
                                 message="Server not ready or model not loaded",
                                 cause=InferenceErrorCause.MODEL_NOT_READY,
-                                chunk_id=chunk.chunk_id,
+                                chunk_id=chunk_id,
                             )
+                            last_exception = err
                             if attempt < self.max_retries - 1:
-                                await asyncio.sleep(self.retry_delay * (2**attempt))
+                                await asyncio.sleep(self.retry_delay * (2 ** attempt))
                                 continue
-                            raise err
+                            break
 
                         if response.status == 500:
                             error_text = await response.text()
@@ -255,112 +285,84 @@ class LlamaServerAdapter(ModelAdapter):
                                 raise ModelInferenceError(
                                     message="Server out of memory",
                                     cause=InferenceErrorCause.OOM,
-                                    chunk_id=chunk.chunk_id,
+                                    chunk_id=chunk_id,
                                 )
                             raise ModelInferenceError(
                                 message=f"Server error: {error_text}",
                                 cause=InferenceErrorCause.UNKNOWN,
-                                chunk_id=chunk.chunk_id,
-                            )
-
-                        if response.status == 400:
-                            body = await response.text()
-                            if mode == "chat" and "unsupported content[].type" in body:
-                                logger.warning(
-                                    "llama-server chat endpoint rejected content parts; "
-                                    "falling back to /v1/completions. body=%s",
-                                    body[:300],
-                                )
-                                last_exception = ModelInferenceError(
-                                    message=f"HTTP 400: {body}",
-                                    cause=InferenceErrorCause.PARSE_ERROR,
-                                    chunk_id=chunk.chunk_id,
-                                )
-                                break
-                            raise ModelInferenceError(
-                                message=f"HTTP 400: {body}",
-                                cause=InferenceErrorCause.PARSE_ERROR,
-                                chunk_id=chunk.chunk_id,
+                                chunk_id=chunk_id,
                             )
 
                         if response.status != 200:
+                            body = await response.text()
                             raise ModelInferenceError(
-                                message=f"HTTP {response.status}: {await response.text()}",
+                                message=f"HTTP {response.status}: {body}",
                                 cause=InferenceErrorCause.UNKNOWN,
-                                chunk_id=chunk.chunk_id,
+                                chunk_id=chunk_id,
                             )
 
                         result = await response.json()
-                        logger.info("Raw API response (%s): %s", mode, result)
 
-                        if "choices" not in result or not result["choices"]:
-                            raise ModelInferenceError(
-                                message="No completion choices returned",
-                                cause=InferenceErrorCause.INSUFFICIENT_OUTPUT,
-                                chunk_id=chunk.chunk_id,
-                            )
+                        if self.debug_log_raw_response:
+                            logger.info("Raw API response (%s): %s", api_mode, result)
 
-                        choice = result["choices"][0]
-                        if "message" in choice and isinstance(choice["message"], dict):
-                            response_text = choice["message"].get("content", "")
-                        elif "text" in choice:
-                            response_text = choice.get("text", "")
-                        else:
-                            raise ModelInferenceError(
-                                message=f"Unexpected response format: {choice}",
-                                cause=InferenceErrorCause.PARSE_ERROR,
-                                chunk_id=chunk.chunk_id,
-                            )
+                        response_text = _extract_text_from_openai_like(result)
 
-                        logger.info("Response text (first 500 chars): %s", (response_text or "")[:500])
+                        if self.debug_log_raw_response:
+                            logger.info("Response text (first 300): %s", (response_text or "")[:300])
 
                         if not response_text or not response_text.strip():
                             raise ModelInferenceError(
                                 message="Model returned empty response",
                                 cause=InferenceErrorCause.INSUFFICIENT_OUTPUT,
-                                chunk_id=chunk.chunk_id,
+                                chunk_id=chunk_id,
                             )
 
-                        candidates = parse_model_response(response_text, chunk.chunk_id)
+                        # ✅ MODE-AWARE parsing (JSON or PLAINTEXT)
+                        candidates = parse_model_response_for_mode(
+                            response_text,
+                            chunk_id=chunk_id,
+                            mode=mode
+                        )
                         return candidates
 
                 except asyncio.TimeoutError:
                     last_exception = ModelInferenceError(
                         message=f"Request timed out after {self.timeout_seconds}s",
                         cause=InferenceErrorCause.TIMEOUT,
-                        chunk_id=chunk.chunk_id,
+                        chunk_id=chunk_id,
                     )
                     if attempt < self.max_retries - 1:
-                        await asyncio.sleep(self.retry_delay * (2**attempt))
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
                         continue
                     break
 
                 except ModelInferenceError as e:
                     last_exception = e
-                    if e.is_retryable() and attempt < self.max_retries - 1:
-                        await asyncio.sleep(self.retry_delay * (2**attempt))
+                    # retry only for retryable causes
+                    if getattr(e, "is_retryable", None) and e.is_retryable() and attempt < self.max_retries - 1:
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
                         continue
-                    if mode == "chat":
-                        break
-                    raise
+                    break
 
                 except Exception as e:
                     last_exception = ModelInferenceError(
                         message=f"Unexpected error during inference: {str(e)}",
                         cause=InferenceErrorCause.UNKNOWN,
-                        chunk_id=chunk.chunk_id,
+                        chunk_id=chunk_id,
                     )
                     if attempt < self.max_retries - 1:
-                        await asyncio.sleep(self.retry_delay * (2**attempt))
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
                         continue
                     break
 
         if isinstance(last_exception, ModelInferenceError):
             raise last_exception
+
         raise ModelInferenceError(
             message="Inference failed (no usable endpoint succeeded)",
             cause=InferenceErrorCause.UNKNOWN,
-            chunk_id=chunk.chunk_id,
+            chunk_id=chunk_id,
         )
 
     def estimate_memory_usage(self, chunk: Chunk) -> int:

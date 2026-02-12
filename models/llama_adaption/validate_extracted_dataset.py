@@ -47,15 +47,15 @@ except ImportError as e:
     raise SystemExit("Missing dependency. Install with: pip install openai pandas") from e
 
 load_dotenv()
-INPUT_CSV = "extracted_dataset.csv"
-OUTPUT_CSV = "extracted_dataset_with_grounded_followup.csv"
-MODEL = "gpt-4.1"
+INPUT_CSV = "iab_followups.csv"
+OUTPUT_CSV = "iab_followups_with_grounded_followup.csv"
+MODEL = "gpt-4.1-mini"
 
 # Early stop: stop once we have this many True rows
-EARLY_STOP_TRUE_TARGET = 100
+EARLY_STOP_TRUE_TARGET = 10000
 
 # Safety limits
-MAX_ARTICLE_CHARS = 50_000
+MAX_ARTICLE_CHARS = 50000
 MAX_QUESTION_CHARS = 500
 
 
@@ -207,9 +207,9 @@ def main() -> None:
 
     df = pd.read_csv(INPUT_CSV)
 
-    if "article" not in df.columns or "provided_questions" not in df.columns:
+    if "article" not in df.columns or "follow_up_questions" not in df.columns:
         raise SystemExit(
-            "CSV must contain columns: 'article' and 'provided_questions'. "
+            "CSV must contain columns: 'article' and 'follow_up_questions'. "
             f"Found columns: {list(df.columns)}"
         )
 
@@ -227,7 +227,7 @@ def main() -> None:
             break
 
         article = row.get("article", "")
-        provided = row.get("provided_questions", "")
+        provided = row.get("follow_up_questions", "")
         questions = parse_questions_cell(provided)
 
         verdict = call_validator(client, str(article), questions)

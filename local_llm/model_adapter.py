@@ -1,15 +1,69 @@
 """
 Edge Question Generation Pipeline - Model Adapter Interface
 Optimized for instruction-tuned models (SmolLM2, etc.)
+
+UPDATED:
+- Adds support for 4 configurations (A/B/C/D) by introducing a Mode object.
+- Keeps backward compatibility: existing adapters can still implement generate_questions(...)
+  and the pipeline can migrate to generate_questions_mode(...) step-by-step.
+- Extends parsing to handle:
+  - JSON single: {"question":"..."}
+  - JSON multi:  {"questions":[{"question":"..."}, ...]} OR {"questions":["...?", ...]}
+  - PLAINTEXT single: "....?"
+  - PLAINTEXT multi: numbered list "1. ...?\n2. ...?"
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, Dict, Any, Tuple
 import json
 import re
 
 from local_llm.pipeline_types import Chunk, QuestionCandidate, GenerationConfig, QuestionType, QuestionStyle
 from local_llm.errors import ModelInferenceError, InferenceErrorCause
+
+
+# ============================================================================
+# Mode / Enums for 4 configurations
+# ============================================================================
+
+class GenerationScope(str, Enum):
+    CHUNKED = "chunked"          # per chunk calls
+    FULL_ARTICLE = "full_article"  # single call with full article
+
+
+class OutputFormat(str, Enum):
+    JSON = "json"               # model returns JSON
+    PLAINTEXT = "plaintext"     # model returns plain text
+
+
+@dataclass(frozen=True)
+class QuestionGenMode:
+    """
+    Describes how the model should be prompted + how output should be parsed.
+    """
+    scope: GenerationScope
+    output_format: OutputFormat
+    questions_per_call: int  # 1 or N
+
+    @staticmethod
+    def A_chunked_json_1() -> "QuestionGenMode":
+        return QuestionGenMode(GenerationScope.CHUNKED, OutputFormat.JSON, 1)
+
+    @staticmethod
+    def B_full_json_n(n: int) -> "QuestionGenMode":
+        return QuestionGenMode(GenerationScope.FULL_ARTICLE, OutputFormat.JSON, n)
+
+    @staticmethod
+    def C_chunked_text_1() -> "QuestionGenMode":
+        return QuestionGenMode(GenerationScope.CHUNKED, OutputFormat.PLAINTEXT, 1)
+
+    @staticmethod
+    def D_full_text_n(n: int) -> "QuestionGenMode":
+        return QuestionGenMode(GenerationScope.FULL_ARTICLE, OutputFormat.PLAINTEXT, n)
 
 
 # ============================================================================
@@ -19,11 +73,12 @@ from local_llm.errors import ModelInferenceError, InferenceErrorCause
 class ModelAdapter(ABC):
     """
     Abstract interface for model inference.
-    
-    Implementations handle runtime-specific details (WebGPU, CPU, etc.)
-    while maintaining consistent API contract.
+
+    Existing contract: generate_questions(chunk, num_candidates=1, ...) -> [QuestionCandidate]
+    New contract: generate_questions_mode(text, mode, ...) -> [QuestionCandidate]
     """
-    
+
+    # ---------------- Existing contract (kept) ----------------
     @abstractmethod
     async def generate_questions(
         self,
@@ -31,90 +86,123 @@ class ModelAdapter(ABC):
         num_candidates: int,
         generation_config: GenerationConfig
     ) -> List[QuestionCandidate]:
-        """
-        Generate questions from a single chunk via non-streaming API call.
-        
-        Args:
-            chunk: Text chunk to process
-            num_candidates: Number of questions to generate (always 1)
-            generation_config: Generation parameters
-            
-        Returns:
-            List of parsed and typed question candidates
-            
-        Raises:
-            ModelInferenceError: On timeout, OOM, or JSON parse failure
-        """
-        pass
-    
+        raise NotImplementedError
+
+    # ---------------- New contract (recommended for 4 modes) ----------------
+    async def generate_questions_mode(
+        self,
+        text: str,
+        chunk_id: int,
+        mode: QuestionGenMode,
+        generation_config: GenerationConfig
+    ) -> List[QuestionCandidate]:
+        # Best-effort compatibility for 1-question-per-call chunked modes
+        if mode.scope == GenerationScope.CHUNKED and mode.questions_per_call == 1:
+            temp_chunk = Chunk(chunk_id=chunk_id, text=text)
+            return await self.generate_questions(temp_chunk, 1, generation_config)
+
+        raise NotImplementedError(
+            "Adapter must implement generate_questions_mode() for full-article or N-per-call modes."
+        )
+
     @abstractmethod
     async def is_ready(self) -> bool:
-        """
-        Check if model is loaded and ready for inference.
-        
-        Returns:
-            True if model is ready, False otherwise
-        """
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     def estimate_memory_usage(self, chunk: Chunk) -> int:
-        """
-        Estimate memory footprint for this model + config.
-        
-        Args:
-            chunk: Chunk to estimate for
-            
-        Returns:
-            Estimated memory usage in bytes
-        """
-        pass
+        raise NotImplementedError
 
 
 # ============================================================================
-# Prompt Template - Chat Messages Format for Instruct Models
+# Prompt Templates (4 modes)
 # ============================================================================
+
+def build_prompt_for_mode(
+    text: str,
+    desired_questions: int,
+    mode: QuestionGenMode,
+    config: GenerationConfig | None = None
+) -> List[Dict[str, str]]:
+    rules = (
+        "Rules:\n"
+        "- Do NOT mention “the text”, “this passage”, or “given context”.\n"
+        "- Do NOT ask about writing style/structure/wording.\n"
+        "- Ask natural questions a human would ask.\n"
+        "- Avoid duplicates.\n"
+    )
+
+    if mode.output_format == OutputFormat.JSON:
+        if mode.questions_per_call == 1:
+            system = (
+                "You are a strict JSON generator.\n"
+                "Output ONLY valid JSON. No extra text.\n"
+                'Schema: {"question":"...?"}\n'
+            )
+            user = (
+                "Write ONE natural question a human would ask after reading the content below.\n\n"
+                f"{rules}\n"
+                "Output ONLY JSON matching the schema.\n\n"
+                f"Content:\n{text}\n"
+            )
+        else:
+            system = (
+                "You are a strict JSON generator.\n"
+                "Output ONLY valid JSON. No extra text.\n"
+                'Schema: {"questions":[{"question":"...?"}, ...]}\n'
+            )
+            user = (
+                f"Generate EXACTLY {desired_questions} distinct, natural questions from the content below.\n\n"
+                f"{rules}\n"
+                "Output ONLY JSON matching the schema.\n\n"
+                f"Content:\n{text}\n"
+            )
+    else:
+        if mode.questions_per_call == 1:
+            system = (
+                "You generate questions.\n"
+                "Output ONLY the question text. No quotes, no numbering, no JSON."
+            )
+            user = (
+                "Write ONE natural question a human would ask after reading the content below.\n\n"
+                f"{rules}\n"
+                "Output ONE line ending with a question mark.\n\n"
+                f"Content:\n{text}\n"
+            )
+        else:
+            system = (
+                "You generate questions.\n"
+                "Output ONLY questions as a numbered list.\n"
+                "No JSON. No extra text."
+            )
+            user = (
+                f"Generate EXACTLY {desired_questions} distinct, natural questions from the content below.\n\n"
+                f"{rules}\n"
+                "Output as a numbered list, one question per line, like:\n"
+                "1. ...?\n2. ...?\n\n"
+                f"Content:\n{text}\n"
+            )
+
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
 
 def build_prompt(chunk_text: str, num_candidates: int = 1, config: GenerationConfig = None):
-    return [
-        {
-            "role": "system",
-            "content": (
-                'Output ONLY one line of valid JSON.\n'
-                'Format exactly: {"question":"...?"}\n'
-                'Question rules: short (6-12 words), grounded in the content, no extra text.\n'
-                'Do NOT include "Style", "Rules", "CONTENT", explanations, or markdown.'
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Write ONE short follow-up question.\n"
-                f"{chunk_text}\n"
-                "Return ONLY the JSON object."
-            ),
-        },
-    ]
+    return build_prompt_for_mode(
+        text=chunk_text,
+        desired_questions=1,
+        mode=QuestionGenMode.A_chunked_json_1(),
+        config=config,
+    )
 
+
+# ============================================================================
+# Chat formatting utility (unchanged)
+# ============================================================================
 
 def format_chat_prompt(
     messages: List[Dict[str, str]],
-    tokenizer = None
+    tokenizer=None
 ) -> str:
-    """
-    Format chat messages into a string prompt.
-    
-    Tries to use tokenizer's chat template if available,
-    otherwise falls back to simple concatenation.
-    
-    Args:
-        messages: List of message dicts with 'role' and 'content'
-        tokenizer: Optional tokenizer with apply_chat_template method
-        
-    Returns:
-        Formatted prompt string
-    """
-    # Try to use tokenizer's chat template
     if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
         try:
             return tokenizer.apply_chat_template(
@@ -124,34 +212,23 @@ def format_chat_prompt(
             )
         except Exception as e:
             print(f"Warning: Chat template failed: {e}")
-    
-    # Manual formatting fallback (ChatML format for SmolLM2)
+
     formatted = ""
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
-        
         formatted += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    
-    # Add generation prompt for assistant
     formatted += "<|im_start|>assistant\n"
-    
     return formatted
 
+
 # ============================================================================
-# Response Parsing - Robust Version with Multiple Strategies
+# Response Parsing - Extended for JSON + PLAINTEXT
 # ============================================================================
 
 def _extract_first_json_object(s: str) -> str | None:
-    """
-    Extract the first complete JSON object from a string using balanced-brace scanning.
-
-    - Ignores braces inside JSON strings
-    - Handles escaped quotes and escaped backslashes
-    """
     if not s:
         return None
-
     start = s.find("{")
     if start == -1:
         return None
@@ -185,220 +262,210 @@ def _extract_first_json_object(s: str) -> str | None:
         if c == "}":
             depth -= 1
             if depth == 0:
-                return s[start : i + 1]
+                return s[start: i + 1]
             if depth < 0:
                 return None
-
     return None
 
 
 def _repair_json_like_text(s: str) -> str:
-    """
-    Best-effort repair for common small-model JSON glitches.
-    Intentionally conservative: only fixes patterns that commonly appear at the END
-    of a JSON string value right before the closing brace.
-    """
     t = (s or "").strip()
     if not t:
         return t
 
-    # Normalize “smart quotes”
     t = t.replace("“", '"').replace("”", '"').replace("’", "'")
 
-    # If the model outputs: ...?\\"}  (stray escaped quote right before })
-    # Example: {"question":"...?\\"}
-    t = re.sub(r'\\+"(\s*})$', r'"\1', t)   # \\"} -> "}
+    # ✅ FIX: JSON does NOT support \' escape. Replace it.
+    t = t.replace("\\'", "'")
 
-    # If the model outputs: ...?""}  (double-quote glitch)
-    # Example: {"question":"...?""}
-    t = re.sub(r'""(\s*})$', r'"\1', t)     # ""} -> "}
-
-    # More general: if it ends with an extra quote right before }
-    # Example: {"question":"...?"}
-    # (already fine) — but if it is {"question":"...?" "}
+    t = re.sub(r'\\+"(\s*})$', r'"\1', t)      # \\"} -> "}
+    t = re.sub(r'""(\s*})$', r'"\1', t)        # ""}  -> "}
     t = re.sub(r'"\s*"\s*}', r'"}', t)
-
-    # Very last-resort: if there is a trailing backslash before a closing quote at end
-    # Example: {"question":"...?\\"} -> {"question":"...?"}
     t = re.sub(r'\\("(\s*})$)', r'\1', t)
-
     return t
 
 
-def parse_model_response(
+def _strip_markdown_fences(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    return s.strip()
+
+
+def _sanitize_question_text(q: str) -> str | None:
+    q = (q or "").strip()
+    if not q:
+        return None
+    q = re.sub(r'^\s*[\-\*\d\.\)\:]+\s*', "", q).strip()
+    q = q.strip('"\''"”“‘’ ").strip()
+    if "?" in q:
+        q = q[: q.rfind("?") + 1].strip()
+        return q if len(q) >= 4 else None
+    return None
+
+
+def _split_numbered_questions(text: str) -> List[str]:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    out: List[str] = []
+    buff: List[str] = []
+
+    def flush():
+        if buff:
+            out.append(" ".join(buff).strip())
+            buff.clear()
+
+    for ln in lines:
+        if re.match(r"^\s*(\d+[\.\)]|[-*])\s+", ln):
+            flush()
+            ln2 = re.sub(r"^\s*(\d+[\.\)]|[-*])\s+", "", ln).strip()
+            buff.append(ln2)
+        else:
+            buff.append(ln)
+    flush()
+    return out
+
+
+def parse_model_response_for_mode(
     response_text: str,
-    chunk_id: int
+    chunk_id: int,
+    mode: QuestionGenMode,
+    limit: Optional[int] = None,
 ) -> List[QuestionCandidate]:
-    """
-    Parse model response with robust error handling.
-
-    Accepts either schema:
-      - {"question": "....?"}
-      - {"questions": ["....?"]}
-
-    Handles:
-    - Extra text before/after JSON
-    - Markdown code fences
-    - Model returning just an array, or raw question text
-    - Basic normalization (ensure question ends with '?')
-    """
-    original_text = response_text
-    cleaned = (response_text or "").strip()
-
-    # Remove markdown code fences
-    cleaned = re.sub(r"^\s*```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-    cleaned = cleaned.strip()
-
-    # ✅ NEW: repair common JSON glitches before parsing attempts
+    original_text = response_text or ""
+    cleaned = _strip_markdown_fences(original_text)
     cleaned = _repair_json_like_text(cleaned)
 
-    data: dict | None = None
+    questions_out: List[str] = []
 
-    # Strategy 1: direct JSON parse
-    try:
-        data0 = json.loads(cleaned)
-        if isinstance(data0, dict):
-            data = data0
-    except Exception:
-        pass
+    if mode.output_format == OutputFormat.JSON:
+        data: dict | None = None
 
-    # Strategy 2: balanced-brace extraction
-    if data is None:
-        obj = _extract_first_json_object(cleaned)
-        if obj:
-            obj = _repair_json_like_text(obj)  # ✅ repair extracted object too
-            try:
-                data0 = json.loads(obj)
-                if isinstance(data0, dict):
-                    data = data0
-            except Exception:
-                pass
-
-    # Strategy 3: regex extraction backstop
-    if data is None:
-        json_match = re.search(
-            r'\{[\s\S]*?"(?:question|questions)"[\s\S]*?\}',
-            cleaned,
-            flags=re.IGNORECASE
-        )
-        if json_match:
-            candidate = _repair_json_like_text(json_match.group(0))  # ✅ repair
-            try:
-                data0 = json.loads(candidate)
-                if isinstance(data0, dict):
-                    data = data0
-            except Exception:
-                pass
-
-    # Strategy 4: array-only output -> wrap
-    if data is None:
-        array_match = re.search(r'\[[\s\S]*?\]', cleaned)
-        if array_match:
-            try:
-                arr = json.loads(array_match.group(0))
-                if isinstance(arr, list):
-                    data = {"questions": arr}
-            except Exception:
-                pass
-
-    # Strategy 5: question-like text -> wrap
-    if data is None:
-        question_patterns = [
-            r'Question:\s*(.+?)(?:\n|$)',
-            r'Q:\s*(.+?)(?:\n|$)',
-            r'(?:^|\n)([A-Z][^.!?]*\?)',
-        ]
-        for pattern in question_patterns:
-            match = re.search(pattern, cleaned, re.MULTILINE | re.IGNORECASE)
-            if match:
-                q = (match.group(1) or "").strip()
-                if q:
-                    data = {"question": q}
-                    break
-
-    if data is None:
-        raise ModelInferenceError(
-            message=f"Failed to parse model response as JSON.\nOriginal: {original_text[:500]}",
-            cause=InferenceErrorCause.PARSE_ERROR,
-            chunk_id=chunk_id
-        )
-
-    if not isinstance(data, dict):
-        raise ModelInferenceError(
-            message=f"Model response is not a JSON object: {type(data)}",
-            cause=InferenceErrorCause.PARSE_ERROR,
-            chunk_id=chunk_id
-        )
-
-    # Normalize supported schemas into a questions list
-    questions: list = []
-
-    if "questions" in data:
-        qv = data["questions"]
-        if isinstance(qv, list):
-            questions = qv
-        elif isinstance(qv, str):
-            questions = [qv]
-        else:
-            raise ModelInferenceError(
-                message=f"'questions' field is not a list or string: {type(qv)}",
-                cause=InferenceErrorCause.PARSE_ERROR,
-                chunk_id=chunk_id
-            )
-
-    elif "question" in data:
-        qv = data["question"]
-        if isinstance(qv, str):
-            questions = [qv]
-        elif isinstance(qv, list):
-            questions = qv
-        else:
-            raise ModelInferenceError(
-                message=f"'question' field is not a string or list: {type(qv)}",
-                cause=InferenceErrorCause.PARSE_ERROR,
-                chunk_id=chunk_id
-            )
-    else:
-        raise ModelInferenceError(
-            message=f"Model response missing 'question'/'questions'. Keys: {list(data.keys())}",
-            cause=InferenceErrorCause.PARSE_ERROR,
-            chunk_id=chunk_id
-        )
-
-    # Build candidates
-    candidates: List[QuestionCandidate] = []
-    for i, q in enumerate(questions):
+        # 1) direct parse
         try:
-            if isinstance(q, str):
-                question_text = q.strip()
-            elif isinstance(q, dict):
-                question_text = (
-                    q.get("question") or
-                    q.get("text") or
-                    q.get("query") or
-                    ""
-                ).strip()
-            else:
-                continue
-
-            if not question_text:
-                continue
-
-            if not question_text.endswith("?"):
-                question_text = question_text.rstrip() + "?"
-
-            candidates.append(
-                QuestionCandidate(
-                    question=question_text,
-                    type=QuestionType.PROCEDURAL,
-                    evidence="",
-                    chunk_id=chunk_id,
-                    style=QuestionStyle.INTERROGATIVE,
-                )
-            )
+            x = json.loads(cleaned)
+            if isinstance(x, dict):
+                data = x
         except Exception:
+            pass
+
+        # 2) balanced extraction
+        if data is None:
+            obj = _extract_first_json_object(cleaned)
+            if obj:
+                obj = _repair_json_like_text(obj)
+                try:
+                    x = json.loads(obj)
+                    if isinstance(x, dict):
+                        data = x
+                except Exception:
+                    pass
+
+        # 3) regex extraction
+        if data is None:
+            m = re.search(r'\{[\s\S]*?"(?:question|questions|output)"[\s\S]*?\}', cleaned, flags=re.IGNORECASE)
+            if m:
+                candidate = _repair_json_like_text(m.group(0))
+                try:
+                    x = json.loads(candidate)
+                    if isinstance(x, dict):
+                        data = x
+                except Exception:
+                    pass
+
+        # 4) array-only output
+        if data is None:
+            m = re.search(r'\[[\s\S]*?\]', cleaned)
+            if m:
+                try:
+                    arr = json.loads(m.group(0))
+                    if isinstance(arr, list):
+                        data = {"questions": arr}
+                except Exception:
+                    pass
+
+        if data is None or not isinstance(data, dict):
+            raise ModelInferenceError(
+                message=f"Failed to parse model response as JSON.\nOriginal: {original_text[:500]}",
+                cause=InferenceErrorCause.PARSE_ERROR,
+                chunk_id=chunk_id
+            )
+
+        # normalize
+        if "questions" in data:
+            qv = data["questions"]
+            if isinstance(qv, list):
+                for it in qv:
+                    if isinstance(it, str):
+                        questions_out.append(it)
+                    elif isinstance(it, dict):
+                        questions_out.append(it.get("question") or it.get("text") or it.get("query") or it.get("output") or "")
+            elif isinstance(qv, str):
+                questions_out.append(qv)
+            else:
+                raise ModelInferenceError(
+                    message=f"'questions' field not list/string: {type(qv)}",
+                    cause=InferenceErrorCause.PARSE_ERROR,
+                    chunk_id=chunk_id
+                )
+
+        elif "question" in data:
+            qv = data["question"]
+            if isinstance(qv, str):
+                questions_out.append(qv)
+            elif isinstance(qv, list):
+                for it in qv:
+                    if isinstance(it, str):
+                        questions_out.append(it)
+                    elif isinstance(it, dict):
+                        questions_out.append(it.get("question") or it.get("text") or it.get("query") or it.get("output") or "")
+            else:
+                raise ModelInferenceError(
+                    message=f"'question' field not string/list: {type(qv)}",
+                    cause=InferenceErrorCause.PARSE_ERROR,
+                    chunk_id=chunk_id
+                )
+
+        # ✅ NEW: accept {"output": "..."} style
+        elif "output" in data:
+            qv = data["output"]
+            if isinstance(qv, str):
+                questions_out.append(qv)
+            else:
+                raise ModelInferenceError(
+                    message=f"'output' field not string: {type(qv)}",
+                    cause=InferenceErrorCause.PARSE_ERROR,
+                    chunk_id=chunk_id
+                )
+        else:
+            raise ModelInferenceError(
+                message=f"Missing 'question'/'questions'/'output'. Keys: {list(data.keys())}",
+                cause=InferenceErrorCause.PARSE_ERROR,
+                chunk_id=chunk_id
+            )
+
+    else:
+        # PLAINTEXT
+        if mode.questions_per_call == 1:
+            questions_out = [cleaned]
+        else:
+            questions_out = _split_numbered_questions(cleaned)
+
+    # sanitize and build candidates
+    candidates: List[QuestionCandidate] = []
+    for q in questions_out:
+        q2 = _sanitize_question_text(q)
+        if not q2:
             continue
+
+        # ✅ FIX: QuestionCandidate in pipeline_types has NO 'evidence' field
+        candidates.append(
+            QuestionCandidate(
+                question=q2,
+                type=QuestionType.PROCEDURAL,
+                chunk_id=chunk_id,
+                style=QuestionStyle.INTERROGATIVE,
+            )
+        )
 
     if not candidates:
         raise ModelInferenceError(
@@ -407,64 +474,28 @@ def parse_model_response(
             chunk_id=chunk_id
         )
 
-    return candidates[:1]
-
-# ============================================================================
-# Mock Adapter (for testing)
-# ============================================================================
-
-class MockAdapter(ModelAdapter):
-    """
-    Mock adapter for testing without actual model inference.
-    """
-    
-    def __init__(self, latency_ms: float = 100):
-        self.latency_ms = latency_ms
-        self._ready = True
-    
-    async def generate_questions(
-        self,
-        chunk: Chunk,
-        num_candidates: int,
-        generation_config: GenerationConfig
-    ) -> List[QuestionCandidate]:
-        """Generate mock question"""
-        import asyncio
-        
-        await asyncio.sleep(self.latency_ms / 1000.0)
-        
-        templates = [
-            "How do I configure this feature?",
-            "What is the purpose of this functionality?",
-            "When should I use this approach?",
-            "Which option is best for my use case?",
-        ]
-        
-        question = templates[chunk.chunk_id % len(templates)]
-        
-        return [QuestionCandidate(
-            question=question,
-            type=QuestionType.PROCEDURAL,
-            evidence="",
-            chunk_id=chunk.chunk_id,
-            style=QuestionStyle.INTERROGATIVE
-        )]
-    
-    async def is_ready(self) -> bool:
-        return self._ready
-    
-    def estimate_memory_usage(self, chunk: Chunk) -> int:
-        return 100 * 1024 * 1024
+    if limit is not None:
+        return candidates[:limit]
+    return candidates
 
 
-# ============================================================================
-# Public API
-# ============================================================================
+def parse_model_response(response_text: str, chunk_id: int) -> List[QuestionCandidate]:
+    return parse_model_response_for_mode(
+        response_text=response_text,
+        chunk_id=chunk_id,
+        mode=QuestionGenMode.A_chunked_json_1(),
+        limit=1,
+    )
+
 
 __all__ = [
     'ModelAdapter',
-    'MockAdapter',
+    'GenerationScope',
+    'OutputFormat',
+    'QuestionGenMode',
+    'build_prompt_for_mode',
     'build_prompt',
     'format_chat_prompt',
+    'parse_model_response_for_mode',
     'parse_model_response',
 ]
