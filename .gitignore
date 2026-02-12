@@ -8,15 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
-
 .env
-
 # llama 
 llama.cpp/
-
 # llama models
 models/llama_adaption/models/*
-
+models/llama_adaption/*.csv
+models/llama_adaption/*.json
 # onnx models
 models/onnx_adaption/onnx_models/*
 
@@ -24,3 +22,6 @@ models/onnx_adaption/onnx_models/*
 web_llm/onnx_adaption_web/smollm2_onnx/*
 web_llm/onnx_adaption_web/smollm2_onnx_fp32/*
 
+# profiles
+profiles/plots/*
+profiles/*.jsonl

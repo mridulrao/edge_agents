@@ -80,24 +80,17 @@ def build_prompt(chunk_text: str, num_candidates: int = 1, config: GenerationCon
         {
             "role": "system",
             "content": (
-                "You generate ONE question and output ONLY valid JSON.\n"
-                "Do not include explanations, markdown, or extra text.\n"
-                "Schema:\n"
-                '{"question":"..."}\n\n'
-                "Rules:\n"
-                "- Do NOT mention 'the text', 'this passage', 'given context', or similar phrases.\n"
-                "- Do NOT ask questions about the text itself (e.g., purpose, structure, wording).\n"
-                "- Ask a natural question a human would ask after reading the content.\n"
-                "- Use specific concepts, entities, or actions from the content.\n"
-                "- The question must be one clear sentence ending with '?'."
+                'Output ONLY one line of valid JSON.\n'
+                'Format exactly: {"question":"...?"}\n'
+                'Question rules: short (6-12 words), grounded in the content, no extra text.\n'
+                'Do NOT include "Style", "Rules", "CONTENT", explanations, or markdown.'
             ),
         },
         {
             "role": "user",
             "content": (
-                "Read the content and ask ONE question about it.\n\n"
-                "CONTENT:\n"
-                f"{chunk_text}\n\n"
+                "Write ONE short follow-up question.\n"
+                f"{chunk_text}\n"
                 "Return ONLY the JSON object."
             ),
         },
