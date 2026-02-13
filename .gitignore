@@ -15,6 +15,7 @@ llama.cpp/
 models/llama_adaption/models/*
 models/llama_adaption/*.csv
 models/llama_adaption/*.json
+models/llama_adaption/iab-data-training
 # onnx models
 models/onnx_adaption/onnx_models/*
 
@@ -25,3 +26,4 @@ web_llm/onnx_adaption_web/smollm2_onnx_fp32/*
 # profiles
 profiles/plots/*
 profiles/*.jsonl
+profiles/*.csv

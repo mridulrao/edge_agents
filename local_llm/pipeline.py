@@ -1,14 +1,26 @@
 """
 Edge Question Generation Pipeline - Orchestration
 End-to-end pipeline with parallel processing support
+
+UPDATED:
+✅ Early-stop generation once we have enough valid+deduped candidates (don’t process extra buffered chunks)
+✅ Clear latency metrics:
+   - time_to_first_question_ms  (TTFQ)
+   - time_to_all_questions_ms   (TTK)
+   - time_to_each_question_ms   ([t1..tK])
+✅ Parallel mode uses as_completed + cancels remaining tasks on early-stop
+✅ Keeps existing tracemalloc + llama-server RSS sampling
+✅ Safe metrics construction: only passes fields that exist on PipelineMetrics (no TypeError)
 """
 
 import time
 import asyncio
-from typing import List, Optional, Tuple
 import tracemalloc
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from typing import List, Optional, Tuple, Dict
 
-import psutil  # NEW: for server RSS tracking
+import psutil  # for server RSS tracking
 
 from local_llm.pipeline_types import (
     ArticleInput,
@@ -17,7 +29,7 @@ from local_llm.pipeline_types import (
     GenerationConfig,
     FinalQuestion,
     PipelineMetrics,
-    PipelineResult
+    PipelineResult,
 )
 from local_llm.errors import PipelineError, PipelineStage, ValidationError
 from local_llm.model_adapter import ModelAdapter
@@ -26,7 +38,7 @@ from local_llm.post_generation import (
     validate_candidates,
     deduplicate_candidates,
     rank_candidates,
-    select_final_questions
+    select_final_questions,
 )
 
 
@@ -55,11 +67,50 @@ async def _sample_rss_peak(pid: int, stop: asyncio.Event, interval_s: float = 0.
         except psutil.NoSuchProcess:
             break
         except Exception:
-            # best effort; ignore transient errors
             pass
         await asyncio.sleep(interval_s)
     return peak
 
+
+# ============================================================================
+# Progress tracking (latency per question)
+# ============================================================================
+
+@dataclass
+class GenerationProgress:
+    """
+    Tracks when the pipeline becomes capable of returning i questions (i=1..K),
+    where "ready" = valid + deduped candidates.
+    """
+    t_start: float
+    k: int
+    time_to_each_question_ms: List[Optional[float]]  # len K
+    time_to_first_question_ms: Optional[float] = None
+    time_to_all_questions_ms: Optional[float] = None
+    ready_count_history: List[Tuple[int, float]] = field(default_factory=list)  # (ready_count, elapsed_ms)
+
+
+# ============================================================================
+# Safe PipelineMetrics construction (avoid breaking if fields not added yet)
+# ============================================================================
+
+def _safe_pipeline_metrics_kwargs(**kwargs) -> dict:
+    """
+    Only include keys that exist in PipelineMetrics, to avoid TypeError when the
+    dataclass hasn't been updated yet.
+    """
+    try:
+        allowed = {f.name for f in dataclass_fields(PipelineMetrics)}
+    except Exception:
+        # Fallback: best effort if PipelineMetrics isn't a dataclass
+        allowed = set(getattr(PipelineMetrics, "__annotations__", {}).keys())
+
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+# ============================================================================
+# Pipeline
+# ============================================================================
 
 class QuestionGenerationPipeline:
     """
@@ -73,28 +124,41 @@ class QuestionGenerationPipeline:
         adapter: ModelAdapter,
         config: Optional[GenerationConfig] = None,
         parallel_processing: bool = False,
-        max_concurrent_chunks: int = 3
+        max_concurrent_chunks: int = 3,
+
+        # Early-stop controls
+        early_stop: bool = True,
+        early_stop_margin: int = 2,
+        min_chunks_before_stop: int = 1,
+
+        # Verbose progress prints (ready count as chunks complete)
+        print_progress: bool = False,
     ):
         """
-        Initialize pipeline with model adapter and config.
-
         Args:
             adapter: Model adapter for inference
             config: Generation configuration (uses defaults if not provided)
             parallel_processing: Enable parallel chunk processing for speed
             max_concurrent_chunks: Maximum concurrent chunk requests (if parallel=True)
+
+            early_stop: If True, stop generating once enough candidates are collected
+            early_stop_margin: Extra deduped+valid candidates to buffer for failures/dedup
+            min_chunks_before_stop: Don't stop before at least this many chunks completed
+
+            print_progress: If True, prints ready_count + elapsed as generation progresses
         """
         self.adapter = adapter
         self.config = config or GenerationConfig()
         self.parallel_processing = parallel_processing
         self.max_concurrent_chunks = max_concurrent_chunks
 
-    async def generate(self, article: ArticleInput) -> List[FinalQuestion]:
-        """
-        Generate questions from article.
+        self.early_stop = early_stop
+        self.early_stop_margin = max(0, int(early_stop_margin))
+        self.min_chunks_before_stop = max(1, int(min_chunks_before_stop))
 
-        Returns N questions as requested in article.desired_questions.
-        """
+        self.print_progress = print_progress
+
+    async def generate(self, article: ArticleInput) -> List[FinalQuestion]:
         result = await self.generate_with_metrics(article)
         return result.questions
 
@@ -106,9 +170,8 @@ class QuestionGenerationPipeline:
         - tracemalloc measures Python heap only (NOT llama-server/model memory).
         - We additionally track llama-server RSS (resident memory) if the adapter exposes a PID.
         """
-        start_time = time.perf_counter()
+        pipeline_start = time.perf_counter()
 
-        # Python heap tracking (useful, but not "model memory")
         tracemalloc.start()
 
         # Server memory tracking
@@ -135,7 +198,6 @@ class QuestionGenerationPipeline:
                 except Exception:
                     server_rss_before_mb = None
 
-                # Start sampler to capture peak during generation
                 rss_task = asyncio.create_task(_sample_rss_peak(server_pid, rss_stop, interval_s=0.2))
 
             # ================================================================
@@ -144,9 +206,11 @@ class QuestionGenerationPipeline:
             chunks = self._pre_generation(article)
 
             # ================================================================
-            # Stage 2: Generation
+            # Stage 2: Generation (with early stop + per-question latency)
             # ================================================================
-            candidates, chunk_times = await self._generation(chunks, article.desired_questions)
+            candidates, chunk_times, gen_progress = await self._generation(
+                chunks, article.desired_questions
+            )
 
             # ================================================================
             # Stage 3: Post-Generation
@@ -169,9 +233,9 @@ class QuestionGenerationPipeline:
                     server_rss_after_mb = None
 
             # ================================================================
-            # Metrics Collection
+            # Metrics collection
             # ================================================================
-            end_time = time.perf_counter()
+            pipeline_end = time.perf_counter()
             _, py_heap_peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
 
@@ -191,12 +255,16 @@ class QuestionGenerationPipeline:
             else:
                 memory_peak_mb = python_heap_peak_mb
 
-            metrics = PipelineMetrics(
+            # Print latency breakdown clearly
+            self._print_latency_breakdown(article.desired_questions, gen_progress)
+
+            # Build metrics (only pass fields that exist on PipelineMetrics)
+            metrics_kwargs = _safe_pipeline_metrics_kwargs(
                 chunks_created=len(chunks),
                 candidates_generated=total_candidates,
                 candidates_validated=validated_count,
                 candidates_deduplicated=deduplicated_count,
-                latency_ms=(end_time - start_time) * 1000.0,
+                latency_ms=(pipeline_end - pipeline_start) * 1000.0,
                 memory_peak_mb=memory_peak_mb,
                 validation_pass_rate=validation_result.pass_rate,
                 deduplication_reduction=(
@@ -205,7 +273,7 @@ class QuestionGenerationPipeline:
                 ),
                 chunk_processing_times=chunk_times,
 
-                # -------- NEW OPTIONAL FIELDS (add to PipelineMetrics with defaults=None)
+                # Optional / NEW fields (safe-filtered)
                 python_heap_peak_mb=python_heap_peak_mb,
                 server_pid=server_pid,
                 server_rss_before_mb=server_rss_before_mb,
@@ -216,8 +284,14 @@ class QuestionGenerationPipeline:
                     if (server_rss_after_mb is not None and server_rss_before_mb is not None)
                     else None
                 ),
+
+                # Per-question latency (safe-filtered; add to PipelineMetrics if you want them stored)
+                time_to_first_question_ms=gen_progress.time_to_first_question_ms,
+                time_to_all_questions_ms=gen_progress.time_to_all_questions_ms,
+                time_to_each_question_ms=gen_progress.time_to_each_question_ms,
             )
 
+            metrics = PipelineMetrics(**metrics_kwargs)
             return PipelineResult(questions=questions, metrics=metrics)
 
         except Exception as e:
@@ -241,19 +315,118 @@ class QuestionGenerationPipeline:
             raise PipelineError(
                 message=f"Unexpected error in pipeline: {str(e)}",
                 stage=PipelineStage.POST_GEN,
-                recoverable=False
+                recoverable=False,
             ) from e
 
+    # ============================================================================
+    # Latency breakdown printing
+    # ============================================================================
+
+    def _print_latency_breakdown(self, k: int, prog: GenerationProgress) -> None:
+        print("\n📊 Latency breakdown (generation readiness):")
+        if k <= 0:
+            print("   • desired_questions=0 (skipping)")
+            return
+
+        if prog.time_to_first_question_ms is not None:
+            print(f"   • time_to_first_question_ms: {prog.time_to_first_question_ms:.1f}")
+        else:
+            print("   • time_to_first_question_ms: None")
+
+        if prog.time_to_all_questions_ms is not None:
+            print(f"   • time_to_all_questions_ms:  {prog.time_to_all_questions_ms:.1f}")
+        else:
+            print("   • time_to_all_questions_ms:  None")
+
+        steps = []
+        for i in range(k):
+            t = prog.time_to_each_question_ms[i]
+            steps.append(f"{i+1}:{t:.0f}ms" if t is not None else f"{i+1}:None")
+        print(f"   • time_to_each_question_ms: [{', '.join(steps)}]")
+
+    # ============================================================================
+    # Early-stop readiness check + progress updates
+    # ============================================================================
+
+    def _init_progress(self, k: int) -> GenerationProgress:
+        k = max(1, int(k))
+        return GenerationProgress(
+            t_start=time.perf_counter(),
+            k=k,
+            time_to_each_question_ms=[None] * k,
+        )
+
+    def _ready_candidate_count(self, candidates: List[QuestionCandidate], chunks: List[Chunk]) -> int:
+        """
+        Returns count of candidates that are (valid + deduplicated).
+        Best proxy for "can we actually return N questions now?"
+        """
+        try:
+            vr = validate_candidates(candidates, chunks)
+            if not vr.valid:
+                return 0
+            deduped = deduplicate_candidates(vr.valid)
+            return len(deduped)
+        except Exception:
+            return 0
+
+    def _update_progress(
+        self,
+        prog: GenerationProgress,
+        candidates: List[QuestionCandidate],
+        chunks: List[Chunk],
+    ) -> int:
+        """
+        Updates progress timestamps based on current candidates.
+        Returns current ready_count (valid+deduped).
+        """
+        ready = self._ready_candidate_count(candidates, chunks)
+        elapsed_ms = (time.perf_counter() - prog.t_start) * 1000.0
+        prog.ready_count_history.append((ready, elapsed_ms))
+
+        upto = min(ready, prog.k)
+        for i in range(1, upto + 1):
+            if prog.time_to_each_question_ms[i - 1] is None:
+                prog.time_to_each_question_ms[i - 1] = elapsed_ms
+
+        if ready >= 1 and prog.time_to_first_question_ms is None:
+            prog.time_to_first_question_ms = elapsed_ms
+
+        if ready >= prog.k and prog.time_to_all_questions_ms is None:
+            prog.time_to_all_questions_ms = elapsed_ms
+
+        if self.print_progress:
+            print(f"   ⏱️ ready={ready}/{prog.k} elapsed={elapsed_ms:.1f}ms")
+
+        return ready
+
+    def _should_stop_early(
+        self,
+        candidates: List[QuestionCandidate],
+        chunks: List[Chunk],
+        k: int,
+        chunks_completed: int,
+    ) -> bool:
+        if not self.early_stop:
+            return False
+        if chunks_completed < self.min_chunks_before_stop:
+            return False
+
+        target = k + self.early_stop_margin
+        ready = self._ready_candidate_count(candidates, chunks)
+        return ready >= target
+
+    # ============================================================================
+    # Stages
+    # ============================================================================
+
     def _pre_generation(self, article: ArticleInput) -> List[Chunk]:
-        """
-        Execute pre-generation stage: chunking with buffer strategy.
-        """
         try:
             chunks = chunk_article(article)
 
             print(f"\n📦 Chunking complete:")
             print(f"   • Desired questions: {article.desired_questions}")
-            print(f"   • Chunks created: {len(chunks)} (1.5x buffer)")
+            print(f"   • Chunks created: {len(chunks)} (buffered)")
             print(f"   • Chunk size: ~200 words each")
 
             return chunks
@@ -261,12 +434,21 @@ class QuestionGenerationPipeline:
             raise PipelineError(
                 message=f"Pre-generation failed: {str(e)}",
                 stage=PipelineStage.PRE_GEN,
-                recoverable=False
+                recoverable=False,
             ) from e
 
-    async def _generation(self, chunks: List[Chunk], desired_questions: int) -> Tuple[List[QuestionCandidate], List[float]]:
+    async def _generation(
+        self,
+        chunks: List[Chunk],
+        desired_questions: int,
+    ) -> Tuple[List[QuestionCandidate], List[float], GenerationProgress]:
         """
-        Execute generation stage: invoke model for each chunk.
+        Generation stage: invoke model for each chunk.
+
+        Returns:
+          - candidates
+          - chunk_times (ms per chunk index; 0 for unused chunks)
+          - GenerationProgress (TTFQ / TTK / per-question curve)
         """
         allocations = allocate_candidates(len(chunks), desired_questions)
 
@@ -274,116 +456,179 @@ class QuestionGenerationPipeline:
             raise PipelineError(
                 message="Model adapter is not ready",
                 stage=PipelineStage.GENERATION,
-                recoverable=True
+                recoverable=True,
             )
+
+        progress = self._init_progress(desired_questions)
 
         if self.parallel_processing:
             print(f"\n⚡ Parallel processing (max {self.max_concurrent_chunks} concurrent)")
-            all_candidates, chunk_times, errors = await self._process_chunks_parallel(chunks, allocations)
+            all_candidates, chunk_times, errors, progress = await self._process_chunks_parallel_early_stop(
+                chunks, allocations, desired_questions, progress
+            )
         else:
             print(f"\n🔄 Sequential processing")
-            all_candidates, chunk_times, errors = await self._process_chunks_sequential(chunks, allocations)
+            all_candidates, chunk_times, errors, progress = await self._process_chunks_sequential_early_stop(
+                chunks, allocations, desired_questions, progress
+            )
 
         if not all_candidates:
             raise PipelineError(
                 message=f"Generation failed for all chunks. Errors: {errors}",
                 stage=PipelineStage.GENERATION,
-                recoverable=False
+                recoverable=False,
             )
 
         print(f"   • Generated {len(all_candidates)} candidate questions")
         if errors:
             print(f"   ⚠️  {len(errors)} chunks failed")
 
-        return all_candidates, chunk_times
+        return all_candidates, chunk_times, progress
 
-    async def _process_chunks_sequential(
+    async def _process_chunks_sequential_early_stop(
         self,
         chunks: List[Chunk],
-        allocations: List[int]
-    ) -> Tuple[List[QuestionCandidate], List[float], List[Exception]]:
+        allocations: List[int],
+        desired_questions: int,
+        progress: GenerationProgress,
+    ) -> Tuple[List[QuestionCandidate], List[float], List[Exception], GenerationProgress]:
         """
-        Process chunks sequentially (memory-safe, default).
+        Sequential chunk processing with early-stop + progress updates.
         """
         all_candidates: List[QuestionCandidate] = []
-        chunk_times: List[float] = []
+        chunk_times: List[float] = [0.0 for _ in range(len(chunks))]
         errors: List[Exception] = []
 
-        for chunk, num_candidates in zip(chunks, allocations):
-            chunk_start = time.perf_counter()
+        chunks_completed = 0
+
+        for idx, (chunk, num_candidates) in enumerate(zip(chunks, allocations)):
+            if num_candidates <= 0:
+                continue
+
+            t0 = time.perf_counter()
             try:
-                candidates = await self.adapter.generate_questions(
+                cands = await self.adapter.generate_questions(
                     chunk=chunk,
                     num_candidates=num_candidates,
-                    generation_config=self.config
+                    generation_config=self.config,
                 )
-                all_candidates.extend(candidates)
+                all_candidates.extend(cands)
             except Exception as e:
                 errors.append(e)
             finally:
-                chunk_end = time.perf_counter()
-                chunk_times.append((chunk_end - chunk_start) * 1000.0)
+                t1 = time.perf_counter()
+                chunk_times[idx] = (t1 - t0) * 1000.0
+                chunks_completed += 1
 
-        return all_candidates, chunk_times, errors
+            # Update latency progress after each chunk completes
+            self._update_progress(progress, all_candidates, chunks)
 
-    async def _process_chunks_parallel(
+            # Early stop if we have enough (valid+deduped) candidates
+            if self._should_stop_early(all_candidates, chunks, desired_questions, chunks_completed):
+                ready = self._ready_candidate_count(all_candidates, chunks)
+                target = desired_questions + self.early_stop_margin
+                print(
+                    f"   ✅ Early stop (sequential): ready={ready} target={target} "
+                    f"after {chunks_completed} chunk(s)"
+                )
+                break
+
+        return all_candidates, chunk_times, errors, progress
+
+    async def _process_chunks_parallel_early_stop(
         self,
         chunks: List[Chunk],
-        allocations: List[int]
-    ) -> Tuple[List[QuestionCandidate], List[float], List[Exception]]:
+        allocations: List[int],
+        desired_questions: int,
+        progress: GenerationProgress,
+    ) -> Tuple[List[QuestionCandidate], List[float], List[Exception], GenerationProgress]:
         """
-        Process chunks in parallel with concurrency control.
+        Parallel chunk processing with concurrency control, early-stop, and task cancellation.
         """
         semaphore = asyncio.Semaphore(self.max_concurrent_chunks)
 
-        async def process_chunk_with_semaphore(
-            chunk: Chunk,
-            num_candidates: int,
-            chunk_idx: int
-        ) -> Tuple[int, List[QuestionCandidate], float, Optional[Exception]]:
-            async with semaphore:
-                chunk_start = time.perf_counter()
-                try:
-                    candidates = await self.adapter.generate_questions(
-                        chunk=chunk,
-                        num_candidates=num_candidates,
-                        generation_config=self.config
-                    )
-                    chunk_end = time.perf_counter()
-                    return chunk_idx, candidates, (chunk_end - chunk_start) * 1000.0, None
-                except Exception as e:
-                    chunk_end = time.perf_counter()
-                    return chunk_idx, [], (chunk_end - chunk_start) * 1000.0, e
-
-        tasks = [
-            process_chunk_with_semaphore(chunk, num_candidates, idx)
-            for idx, (chunk, num_candidates) in enumerate(zip(chunks, allocations))
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        results.sort(key=lambda x: x[0])
-
+        chunk_times: List[float] = [0.0 for _ in range(len(chunks))]
         all_candidates: List[QuestionCandidate] = []
-        chunk_times: List[float] = []
         errors: List[Exception] = []
 
-        for _, candidates, elapsed_ms, error in results:
-            chunk_times.append(elapsed_ms)
-            if error:
-                errors.append(error)
-            else:
-                all_candidates.extend(candidates)
+        scheduled: List[Tuple[int, Chunk, int]] = [
+            (idx, chunks[idx], allocations[idx])
+            for idx in range(len(chunks))
+            if allocations[idx] > 0
+        ]
 
-        return all_candidates, chunk_times, errors
+        async def run_one(idx: int, chunk: Chunk, num_candidates: int) -> Tuple[int, List[QuestionCandidate], float, Optional[Exception]]:
+            async with semaphore:
+                t0 = time.perf_counter()
+                try:
+                    cands = await self.adapter.generate_questions(
+                        chunk=chunk,
+                        num_candidates=num_candidates,
+                        generation_config=self.config,
+                    )
+                    t1 = time.perf_counter()
+                    return idx, cands, (t1 - t0) * 1000.0, None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    t1 = time.perf_counter()
+                    return idx, [], (t1 - t0) * 1000.0, e
+
+        tasks_by_idx: Dict[int, asyncio.Task] = {
+            idx: asyncio.create_task(run_one(idx, ch, n))
+            for (idx, ch, n) in scheduled
+        }
+        pending: set[asyncio.Task] = set(tasks_by_idx.values())
+
+        chunks_completed = 0
+
+        try:
+            for fut in asyncio.as_completed(pending):
+                idx, cands, elapsed_ms, err = await fut
+                chunk_times[idx] = elapsed_ms
+                chunks_completed += 1
+
+                if err is not None:
+                    errors.append(err)
+                else:
+                    all_candidates.extend(cands)
+
+                # Update latency progress after each completed task
+                self._update_progress(progress, all_candidates, chunks)
+
+                # Early stop → cancel remaining tasks
+                if self._should_stop_early(all_candidates, chunks, desired_questions, chunks_completed):
+                    ready = self._ready_candidate_count(all_candidates, chunks)
+                    target = desired_questions + self.early_stop_margin
+                    print(
+                        f"   ✅ Early stop (parallel): ready={ready} target={target} "
+                        f"after {chunks_completed} chunk(s) (cancelling remaining)"
+                    )
+
+                    for t in tasks_by_idx.values():
+                        if not t.done():
+                            t.cancel()
+
+                    await asyncio.gather(*tasks_by_idx.values(), return_exceptions=True)
+                    break
+
+        except Exception:
+            for t in tasks_by_idx.values():
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks_by_idx.values(), return_exceptions=True)
+            raise
+
+        return all_candidates, chunk_times, errors, progress
 
     def _post_generation(
         self,
         candidates: List[QuestionCandidate],
         chunks: List[Chunk],
-        k: int
+        k: int,
     ) -> List[FinalQuestion]:
         """
-        Execute post-generation stage: minimal validation, take top K.
+        Post-generation: validate → dedup → rank → select top K.
         """
         try:
             print(f"\n🔍 Post-processing:")
@@ -391,12 +636,11 @@ class QuestionGenerationPipeline:
             print(f"   • Requested questions: {k}")
 
             validation_result = validate_candidates(candidates, chunks)
-
             if not validation_result.valid:
                 raise ValidationError(
                     message="All candidates failed validation",
                     rejected_count=len(validation_result.rejected),
-                    valid_count=0
+                    valid_count=0,
                 )
 
             print(f"   • Valid candidates: {len(validation_result.valid)}")
@@ -406,7 +650,6 @@ class QuestionGenerationPipeline:
             final_questions = select_final_questions(ranked, k)
 
             print(f"   • Final questions: {len(final_questions)}")
-
             if len(final_questions) < k:
                 print(f"   ⚠️  Got {len(final_questions)} questions, wanted {k}")
 
@@ -418,10 +661,8 @@ class QuestionGenerationPipeline:
             raise PipelineError(
                 message=f"Post-generation failed: {str(e)}",
                 stage=PipelineStage.POST_GEN,
-                recoverable=False
+                recoverable=False,
             ) from e
 
 
-__all__ = [
-    "QuestionGenerationPipeline",
-]
+__all__ = ["QuestionGenerationPipeline"]
