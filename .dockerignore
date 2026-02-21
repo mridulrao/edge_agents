@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.eggs
+dist
+build
+.venv
+venv
+env
+
+# Tests and dev files
+tests/
+*.test.py
+*_test.py
+test_*.py
+profiles/
+*.jsonl
+
+# llama.cpp — everything except the source needed to build
+# (the builder stage only needs the source; exclude pre-built artifacts
+#  since we rebuild them cleanly inside Docker)
+models/llama.cpp/build/
+models/llama.cpp/.git/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docs
+*.md
+docs/

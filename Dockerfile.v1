@@ -1,0 +1,178 @@
+# =============================================================================
+# Stage 1 — Build llama.cpp (CPU-only) with TWO variants:
+#   1) baseline: no AVX/AVX2/AVX512  (max portability)
+#   2) avx2:     AVX + AVX2 enabled  (fast on most cloud CPUs)
+#
+# IMPORTANT:
+#   BUILD_SHARED_LIBS=OFF so llama-server does NOT depend on libllama.so/libggml.so
+#   at runtime (fixes missing shared libs).
+# =============================================================================
+FROM ubuntu:22.04 AS llama-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY models/llama.cpp ./llama.cpp
+
+RUN rm -rf llama.cpp/build-baseline llama.cpp/build-avx2 /out \
+    && mkdir -p /out
+
+# ---------------------------
+# Baseline build (portable)
+# ---------------------------
+RUN set -eux; \
+    cmake -S llama.cpp -B llama.cpp/build-baseline \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_NATIVE=OFF \
+      -DGGML_AVX=OFF \
+      -DGGML_AVX2=OFF \
+      -DGGML_AVX512=OFF \
+      -DGGML_METAL=OFF \
+      -DGGML_CUDA=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DBUILD_SHARED_LIBS=OFF; \
+    cmake --build llama.cpp/build-baseline --config Release --target llama-server -j"$(nproc)"; \
+    echo "=== DEBUG baseline: executables ==="; \
+    find llama.cpp/build-baseline -maxdepth 8 -type f -perm -111 -print | head -n 200; \
+    found=""; \
+    for pat in "llama-server" "server" "*llama*server*" "*server*"; do \
+      cand="$(find llama.cpp/build-baseline -type f -perm -111 -name "$pat" 2>/dev/null | head -n 1 || true)"; \
+      if [ -n "$cand" ]; then found="$cand"; break; fi; \
+    done; \
+    echo "baseline server candidate: ${found}"; \
+    test -n "${found}"; \
+    install -m 755 "$found" /out/llama-server-baseline; \
+    strip /out/llama-server-baseline || true; \
+    test -f /out/llama-server-baseline; \
+    echo "✅ baseline OK"
+
+# ---------------------------
+# AVX2 build (fast)
+# ---------------------------
+RUN set -eux; \
+    cmake -S llama.cpp -B llama.cpp/build-avx2 \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_NATIVE=OFF \
+      -DGGML_AVX=ON \
+      -DGGML_AVX2=ON \
+      -DGGML_AVX512=OFF \
+      -DGGML_METAL=OFF \
+      -DGGML_CUDA=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DBUILD_SHARED_LIBS=OFF; \
+    cmake --build llama.cpp/build-avx2 --config Release --target llama-server -j"$(nproc)"; \
+    echo "=== DEBUG avx2: executables ==="; \
+    find llama.cpp/build-avx2 -maxdepth 8 -type f -perm -111 -print | head -n 200; \
+    found=""; \
+    for pat in "llama-server" "server" "*llama*server*" "*server*"; do \
+      cand="$(find llama.cpp/build-avx2 -type f -perm -111 -name "$pat" 2>/dev/null | head -n 1 || true)"; \
+      if [ -n "$cand" ]; then found="$cand"; break; fi; \
+    done; \
+    echo "avx2 server candidate: ${found}"; \
+    test -n "${found}"; \
+    install -m 755 "$found" /out/llama-server-avx2; \
+    strip /out/llama-server-avx2 || true; \
+    test -f /out/llama-server-avx2; \
+    echo "✅ avx2 OK"
+
+
+# =============================================================================
+# Stage 2 — Copy uv binary from official image
+# =============================================================================
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
+
+# =============================================================================
+# Stage 3 — Python runtime
+# =============================================================================
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_PYTHON_DOWNLOADS=never \
+    PATH="/app/.venv/bin:/usr/local/bin:$PATH"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libstdc++6 \
+    libgomp1 \
+    curl \
+    bash \
+    util-linux \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv  /usr/local/bin/uv
+COPY --from=uv /uvx /usr/local/bin/uvx
+
+WORKDIR /app
+
+# ── Python dependencies ───────────────────────────────────────────────────────
+COPY pyproject.toml ./
+COPY uv.lock* ./
+RUN uv sync --frozen --no-dev
+
+# ── llama-server binaries ─────────────────────────────────────────────────────
+RUN mkdir -p /opt/llama
+COPY --from=llama-builder /out/llama-server-baseline /opt/llama/llama-server-baseline
+COPY --from=llama-builder /out/llama-server-avx2     /opt/llama/llama-server-avx2
+RUN chmod +x /opt/llama/llama-server-baseline /opt/llama/llama-server-avx2
+
+# ── Application source ────────────────────────────────────────────────────────
+COPY local_llm/             ./local_llm/
+COPY models/llama_adaption/ ./models/llama_adaption/
+COPY models/llama_adaption/models/ ./models/llama_adaption/models/
+
+# ── Inline entrypoint (no separate file, no heredoc) ─────────────────────────
+RUN printf '%s\n' \
+'#!/usr/bin/env bash' \
+'set -euo pipefail' \
+'' \
+'echo "=== DIAG: system ==="' \
+'uname -m || true' \
+'command -v lscpu >/dev/null 2>&1 && lscpu | egrep '\''Architecture|Model name|Flags'\'' || true' \
+'' \
+'echo "=== DIAG: llama binaries ==="' \
+'ls -lh /opt/llama/llama-server-* || true' \
+'file /opt/llama/llama-server-baseline || true' \
+'file /opt/llama/llama-server-avx2 || true' \
+'' \
+'chosen="/opt/llama/llama-server-baseline"' \
+'if grep -qm1 "avx2" /proc/cpuinfo; then chosen="/opt/llama/llama-server-avx2"; fi' \
+'echo "=== DIAG: chosen llama-server: ${chosen} ==="' \
+'ldd "${chosen}" || true' \
+'' \
+'mkdir -p /app/models/llama.cpp/build/bin' \
+'ln -sf "${chosen}" /app/models/llama.cpp/build/bin/llama-server' \
+'chmod +x /app/models/llama.cpp/build/bin/llama-server || true' \
+'' \
+'echo "=== DIAG: llama-server --version ==="' \
+'/app/models/llama.cpp/build/bin/llama-server --version || true' \
+'' \
+'exec "$@"' \
+> /entrypoint.sh \
+ && chmod +x /entrypoint.sh
+
+# ── Non-root user ─────────────────────────────────────────────────────────────
+RUN useradd -m -u 1000 appuser \
+ && chown -R appuser:appuser /app /opt/llama /entrypoint.sh
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+CMD ["uvicorn", "models.llama_adaption.inference_api:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--log-level", "info"]
