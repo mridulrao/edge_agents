@@ -14,6 +14,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import uuid
@@ -41,11 +42,29 @@ from local_llm.pipeline_types import ArticleInput, GenerationConfig
 _APP_ROOT         = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH        = str(_APP_ROOT / "models/llama_adaption/models/LiquidAI_LFM2-350M-GGUF/LFM2-350M-Q4_K_M.gguf")
 LLAMA_SERVER_PATH = str(_APP_ROOT / "models/llama.cpp/build/bin/llama-server")
-LLAMA_HOST        = "127.0.0.1"
-LLAMA_PORT        = 8080
-CTX_SIZE          = 1048
-N_THREADS         = 4
-N_GPU_LAYERS      = 0
+LLAMA_HOST        = os.getenv("LLAMA_HOST", "127.0.0.1")
+LLAMA_PORT        = int(os.getenv("LLAMA_PORT", "8080"))
+
+# Context size (keep your default, but allow override)
+CTX_SIZE          = int(os.getenv("CTX_SIZE", "1048"))
+N_GPU_LAYERS      = int(os.getenv("N_GPU_LAYERS", "0"))
+
+# Threads: default to something sensible for CPU pods.
+# If LLAMA_THREADS is set, use it.
+# Else use min(cpu_count, 16) as a safe starting point.
+def _default_threads() -> int:
+    c = os.cpu_count() or 4
+    return max(4, min(c, 16))
+
+N_THREADS = int(os.getenv("LLAMA_THREADS", str(_default_threads())))
+
+# Batching knobs (llama.cpp server flags usually support these; we plumb them through)
+# Start conservative; tune later.
+BATCH_SIZE  = int(os.getenv("LLAMA_BATCH_SIZE", "512"))   # prompt prefill batching
+UBATCH_SIZE = int(os.getenv("LLAMA_UBATCH_SIZE", "128"))  # micro-batch (sometimes called --ubatch-size)
+
+# Optional: keep the server hot between requests, reduce cold-start variance
+KEEP_ALIVE_S = int(os.getenv("LLAMA_KEEP_ALIVE_S", "300"))
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +92,14 @@ async def lifespan(app: FastAPI):
     print(f"📂 APP_ROOT   : {_APP_ROOT}")
     print(f"📂 MODEL_PATH : {MODEL_PATH}")
     print(f"📂 LLAMA_BIN  : {LLAMA_SERVER_PATH}")
+    print(f"⚙️  LLAMA_HOST : {LLAMA_HOST}")
+    print(f"⚙️  LLAMA_PORT : {LLAMA_PORT}")
+    print(f"⚙️  CTX_SIZE   : {CTX_SIZE}")
+    print(f"⚙️  THREADS    : {N_THREADS} (cpu_count={os.cpu_count()})")
+    print(f"⚙️  BATCH      : {BATCH_SIZE}")
+    print(f"⚙️  UBATCH     : {UBATCH_SIZE}")
+    print(f"⚙️  KEEPALIVE  : {KEEP_ALIVE_S}s")
+    print(f"⚙️  GPU_LAYERS : {N_GPU_LAYERS}")
 
     if not Path(MODEL_PATH).exists():
         raise RuntimeError(f"Model not found: {MODEL_PATH}")
@@ -80,15 +107,34 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"llama-server binary not found: {LLAMA_SERVER_PATH}")
 
     print(f"⏳ Starting llama-server on port {LLAMA_PORT}…")
-    state.adapter = await create_adapter_with_server(
-        model_path=MODEL_PATH,
-        host=LLAMA_HOST,
-        port=LLAMA_PORT,
-        n_gpu_layers=N_GPU_LAYERS,
-        ctx_size=CTX_SIZE,
-        n_threads=N_THREADS,
-        llama_server_path=LLAMA_SERVER_PATH,
-    )
+
+    # Some versions of your adapter may not accept batch/ubatch/keepalive kwargs yet.
+    # Try with batching first; if TypeError occurs (unexpected kwargs), retry without them.
+    try:
+        state.adapter = await create_adapter_with_server(
+            model_path=MODEL_PATH,
+            host=LLAMA_HOST,
+            port=LLAMA_PORT,
+            n_gpu_layers=N_GPU_LAYERS,
+            ctx_size=CTX_SIZE,
+            n_threads=N_THREADS,
+            llama_server_path=LLAMA_SERVER_PATH,
+            batch_size=BATCH_SIZE,
+            ubatch_size=UBATCH_SIZE,
+            keep_alive_s=KEEP_ALIVE_S,
+        )
+    except TypeError as e:
+        print(f"⚠️  Adapter did not accept batching kwargs ({e}). Retrying without batch/ubatch/keepalive...")
+        state.adapter = await create_adapter_with_server(
+            model_path=MODEL_PATH,
+            host=LLAMA_HOST,
+            port=LLAMA_PORT,
+            n_gpu_layers=N_GPU_LAYERS,
+            ctx_size=CTX_SIZE,
+            n_threads=N_THREADS,
+            llama_server_path=LLAMA_SERVER_PATH,
+        )
+
     state.server_start_time = time.time()
     print("✅ llama-server ready.")
 

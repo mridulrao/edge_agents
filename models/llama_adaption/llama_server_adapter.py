@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 
 import aiohttp
 
@@ -105,6 +105,22 @@ def _normalize_stop(stop: Any) -> Optional[List[str]]:
     return [s] if s else None
 
 
+def _clamp_int(name: str, val: Optional[int], lo: int, hi: int) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        v = int(val)
+    except Exception:
+        raise ValueError(f"{name} must be int, got {val!r}")
+    if v < lo:
+        logger.warning("%s=%s too small; clamping to %s", name, v, lo)
+        return lo
+    if v > hi:
+        logger.warning("%s=%s too large; clamping to %s", name, v, hi)
+        return hi
+    return v
+
+
 # ============================================================================
 # LlamaServer Adapter
 # ============================================================================
@@ -129,6 +145,7 @@ class LlamaServerAdapter(ModelAdapter):
         retry_delay: float = 1.0,
         prefer_chat_endpoint: bool = True,
         debug_log_prompts: bool = False,
+        log_raw_responses: bool = False,   # NEW: can silence huge logs
     ):
         self.server_manager = server_manager
 
@@ -144,11 +161,11 @@ class LlamaServerAdapter(ModelAdapter):
         self.retry_delay = retry_delay
         self.prefer_chat_endpoint = prefer_chat_endpoint
         self.debug_log_prompts = debug_log_prompts
+        self.log_raw_responses = log_raw_responses
 
         self._ready = False
         self._session: Optional[aiohttp.ClientSession] = None
 
-    # NEW: convenience
     def get_server_pid(self) -> Optional[int]:
         return self.server_manager.pid if self.server_manager else None
 
@@ -199,7 +216,7 @@ class LlamaServerAdapter(ModelAdapter):
 
         stop_list = _normalize_stop(getattr(generation_config, "stop_sequences", None))
 
-        chat_payload = {
+        chat_payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt_str}],
             "temperature": generation_config.temperature,
             "top_p": generation_config.top_p,
@@ -209,7 +226,7 @@ class LlamaServerAdapter(ModelAdapter):
         if stop_list:
             chat_payload["stop"] = stop_list
 
-        completion_payload = {
+        completion_payload: Dict[str, Any] = {
             "prompt": prompt_str,
             "temperature": generation_config.temperature,
             "top_p": generation_config.top_p,
@@ -291,7 +308,9 @@ class LlamaServerAdapter(ModelAdapter):
                             )
 
                         result = await response.json()
-                        logger.info("Raw API response (%s): %s", mode, result)
+
+                        if self.log_raw_responses:
+                            logger.info("Raw API response (%s): %s", mode, result)
 
                         if "choices" not in result or not result["choices"]:
                             raise ModelInferenceError(
@@ -408,15 +427,63 @@ async def create_adapter_with_server(
     port: int = 8080,
     n_gpu_layers: int = 0,
     ctx_size: int = 4096,
+    n_threads: int = 4,
+    batch_size: Optional[int] = None,
+    ubatch_size: Optional[int] = None,
+    keep_alive_s: Optional[int] = None,
     llama_server_path: str = "llama-server",
+    timeout_seconds: float = 30.0,
+    max_retries: int = 3,
+    retry_delay: float = 1.0,
+    prefer_chat_endpoint: bool = True,
+    debug_log_prompts: bool = False,
+    log_raw_responses: bool = False,
     **kwargs,
 ) -> LlamaServerAdapter:
+    """
+    Start a managed local llama-server and return a ready adapter.
+
+    Parameters newly supported for CPU perf tuning:
+      - n_threads:      server threads
+      - batch_size:     prompt batch size (prefill)
+      - ubatch_size:    micro-batch size
+      - keep_alive_s:   keep model hot between requests (seconds)
+
+    NOTE: For these to have effect, LlamaServerManager must translate ServerConfig
+    fields into llama-server CLI flags.
+    """
+    n_threads = _clamp_int("n_threads", n_threads, lo=1, hi=256) or 4
+    batch_size = _clamp_int("batch_size", batch_size, lo=1, hi=4096)
+    ubatch_size = _clamp_int("ubatch_size", ubatch_size, lo=1, hi=4096)
+    keep_alive_s = _clamp_int("keep_alive_s", keep_alive_s, lo=0, hi=86400)
+
+    if batch_size is not None and ubatch_size is not None and ubatch_size > batch_size:
+        logger.warning("ubatch_size (%s) > batch_size (%s); clamping ubatch to batch", ubatch_size, batch_size)
+        ubatch_size = batch_size
+
+    # Put perf knobs into kwargs so we stay compatible even if ServerConfig
+    # doesn't have explicit fields yet.
+    perf_kwargs: Dict[str, Any] = {}
+    perf_kwargs["n_threads"] = n_threads
+    if batch_size is not None:
+        perf_kwargs["batch_size"] = batch_size
+    if ubatch_size is not None:
+        perf_kwargs["ubatch_size"] = ubatch_size
+    if keep_alive_s is not None:
+        perf_kwargs["keep_alive_s"] = keep_alive_s
+
+    logger.info(
+        "Starting llama-server: host=%s port=%s ctx=%s gpu_layers=%s threads=%s batch=%s ubatch=%s keepalive=%s",
+        host, port, ctx_size, n_gpu_layers, n_threads, batch_size, ubatch_size, keep_alive_s,
+    )
+
     config = ServerConfig(
         model_path=model_path,
         host=host,
         port=port,
         n_gpu_layers=n_gpu_layers,
         ctx_size=ctx_size,
+        **perf_kwargs,
         **kwargs,
     )
 
@@ -426,7 +493,15 @@ async def create_adapter_with_server(
     if not success:
         raise RuntimeError("Failed to start llama-server")
 
-    adapter = LlamaServerAdapter(server_manager=manager)
+    adapter = LlamaServerAdapter(
+        server_manager=manager,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        prefer_chat_endpoint=prefer_chat_endpoint,
+        debug_log_prompts=debug_log_prompts,
+        log_raw_responses=log_raw_responses,
+    )
     return adapter
 
 

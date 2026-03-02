@@ -11,8 +11,9 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 import aiohttp
 import logging
+import os
 
-import psutil 
+import psutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,6 +52,11 @@ def _proc_mem_mb(pid: int) -> Dict[str, float | None]:
     return out
 
 
+def _default_threads() -> int:
+    c = os.cpu_count() or 4
+    return max(4, min(c, 16))
+
+
 @dataclass
 class ServerConfig:
     """Configuration for llama-server instance"""
@@ -70,11 +76,26 @@ class ServerConfig:
     n_gpu_layers: int = 0  # 0 = CPU only, -1 = all layers on GPU
 
     # Threading
-    n_threads: int = 4
+    n_threads: int = _default_threads()
+
+    # Batching (NEW)
+    # These map to llama-server flags:
+    #   --batch-size <int>
+    #   --ubatch-size <int>
+    batch_size: int = 512
+    ubatch_size: int = 128
+
+    # Keep model hot between requests (NEW)
+    # llama-server flag in most builds: --keep-alive <seconds>
+    keep_alive_s: int = 300
 
     # Memory settings
     no_mmap: bool = False  # Disable memory mapping
     mlock: bool = False    # Lock model in RAM
+
+    # Optional toggles (NEW, default off)
+    flash_attn: bool = False
+    no_webui: bool = True
 
     # Additional args
     extra_args: list = None
@@ -82,6 +103,20 @@ class ServerConfig:
     def __post_init__(self):
         if self.extra_args is None:
             self.extra_args = []
+
+        # Guardrails
+        if self.n_threads < 1:
+            self.n_threads = 1
+        if self.batch_size < 1:
+            self.batch_size = 1
+        if self.ubatch_size < 1:
+            self.ubatch_size = 1
+        if self.ubatch_size > self.batch_size:
+            logger.warning("ubatch_size (%s) > batch_size (%s); clamping ubatch to batch",
+                           self.ubatch_size, self.batch_size)
+            self.ubatch_size = self.batch_size
+        if self.keep_alive_s < 0:
+            self.keep_alive_s = 0
 
     def to_cmd_args(self, llama_server_path: str = "llama-server", is_llama_cli: bool = False) -> list:
         """Convert config to command-line arguments"""
@@ -98,6 +133,11 @@ class ServerConfig:
             "--ctx-size", str(self.ctx_size),
             "--n-predict", str(self.n_predict),
             "--threads", str(self.n_threads),
+
+            # NEW: batching + keepalive
+            "--batch-size", str(self.batch_size),
+            "--ubatch-size", str(self.ubatch_size),
+            "--keep-alive", str(self.keep_alive_s),
         ])
 
         # GPU layers
@@ -111,7 +151,14 @@ class ServerConfig:
         if self.mlock:
             args.append("--mlock")
 
-        # Add extra args
+        # Optional toggles (only add if enabled)
+        if self.flash_attn:
+            args.append("--flash-attn")
+
+        if self.no_webui:
+            args.append("--no-webui")
+
+        # Add extra args (last so they can override)
         args.extend(self.extra_args)
 
         return args
@@ -135,15 +182,6 @@ class LlamaServerManager:
         startup_timeout: float = 120.0,
         health_check_interval: float = 1.0,
     ):
-        """
-        Initialize server manager.
-
-        Args:
-            config: Server configuration
-            llama_server_path: Path to llama-server binary (or llama-cli)
-            startup_timeout: Max seconds to wait for server startup
-            health_check_interval: Seconds between health checks
-        """
         self.config = config
         self.llama_server_path = llama_server_path
         self.startup_timeout = startup_timeout
@@ -152,39 +190,31 @@ class LlamaServerManager:
         self.process: Optional[subprocess.Popen] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._shutdown_requested = False
-        self._is_llama_cli = False  # Track if we're using llama-cli
+        self._is_llama_cli = False
 
-        # NEW: last start/load stats for external consumers (profiling scripts)
         self.last_start_stats: Optional[Dict[str, Any]] = None
 
     @property
     def base_url(self) -> str:
-        """Get server base URL"""
         return f"http://{self.config.host}:{self.config.port}"
 
     @property
     def is_running(self) -> bool:
-        """Check if process is running"""
         return self.process is not None and self.process.poll() is None
 
     @property
     def pid(self) -> Optional[int]:
-        """PID of the llama-server process (if spawned)."""
         return self.process.pid if self.process is not None else None
 
     async def _ensure_session(self):
-        """Create aiohttp session if needed"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
     async def _close_session(self):
-        """Close aiohttp session"""
         if self._session and not self._session.closed:
             await self._session.close()
 
     def _validate_config(self):
-        """Validate configuration before starting"""
-        # Check model file exists
         model_path = Path(self.config.model_path)
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {self.config.model_path}")
@@ -192,7 +222,6 @@ class LlamaServerManager:
         if model_path.suffix != ".gguf":
             logger.warning(f"Model file does not have .gguf extension: {model_path}")
 
-        # Try to find a working llama binary
         binaries_to_try = [
             self.llama_server_path,
             "llama-server",
@@ -215,7 +244,6 @@ class LlamaServerManager:
                 )
                 if result.returncode == 0:
                     working_binary = binary
-                    # Check if this is llama-cli
                     if "llama-cli" in binary.lower() or "cli" in result.stdout.lower():
                         self._is_llama_cli = True
                         logger.info(f"Using llama-cli as server: {binary}")
@@ -231,30 +259,15 @@ class LlamaServerManager:
             raise FileNotFoundError(
                 "No working llama binary found. Tried:\n"
                 + "\n".join(f"  - {b}" for b in binaries_to_try)
-                + "\n\nTo install llama.cpp:\n"
-                  "  git clone https://github.com/ggerganov/llama.cpp.git\n"
-                  "  cd llama.cpp\n"
-                  "  mkdir build && cd build\n"
-                  "  cmake .. -DGGML_METAL=ON  # For macOS\n"
-                  "  cmake --build . --config Release\n"
-                  "  # Binary will be in build/bin/llama-server or build/bin/llama-cli"
             )
 
-        # Update the path to the working binary
         self.llama_server_path = working_binary
 
     async def start(self) -> bool:
-        """
-        Start llama-server process.
-
-        Returns:
-            True if server started successfully, False otherwise
-        """
         if self.is_running:
             logger.warning("Server is already running")
             return True
 
-        # Validate configuration
         try:
             self._validate_config()
         except Exception as e:
@@ -264,7 +277,6 @@ class LlamaServerManager:
         cmd = self.config.to_cmd_args(self.llama_server_path, self._is_llama_cli)
         logger.info(f"Starting {'llama-cli' if self._is_llama_cli else 'llama-server'}: {' '.join(cmd)}")
 
-        # Start process
         try:
             t_spawn0 = time.perf_counter()
             self.process = subprocess.Popen(
@@ -281,8 +293,6 @@ class LlamaServerManager:
 
         pid = self.pid
         logger.info(f"Spawned server PID={pid} (spawn_latency_ms={(t_spawn1 - t_spawn0) * 1000.0:.1f})")
-
-        # Wait for ready + track load latency + memory peaks during load
         logger.info(f"Waiting for server to become ready (timeout: {self.startup_timeout}s)...")
 
         await self._ensure_session()
@@ -294,9 +304,7 @@ class LlamaServerManager:
         vms_peak = 0.0
         uss_peak: Optional[float] = None
 
-        # Loop until healthy or timeout
         while time.time() - start_time < self.startup_timeout:
-            # If process died, log stderr and fail
             if not self.is_running:
                 logger.error("Server process died during startup")
                 if self.process and self.process.stderr:
@@ -307,14 +315,9 @@ class LlamaServerManager:
                     except Exception:
                         pass
                 await self.stop()
-                self.last_start_stats = {
-                    "ok": False,
-                    "pid": pid,
-                    "error": "process_died_during_startup",
-                }
+                self.last_start_stats = {"ok": False, "pid": pid, "error": "process_died_during_startup"}
                 return False
 
-            # Sample memory peak
             if pid is not None:
                 try:
                     m = _proc_mem_mb(pid)
@@ -325,7 +328,6 @@ class LlamaServerManager:
                 except Exception:
                     pass
 
-            # Health check
             try:
                 async with self._session.get(
                     f"{self.base_url}/health",
@@ -377,21 +379,11 @@ class LlamaServerManager:
             "pid": pid,
             "error": "startup_timeout",
             "cmd": cmd,
-            "peaks_during_load": {
-                "rss_peak_mb": rss_peak,
-                "vms_peak_mb": vms_peak,
-                "uss_peak_mb": uss_peak,
-            },
+            "peaks_during_load": {"rss_peak_mb": rss_peak, "vms_peak_mb": vms_peak, "uss_peak_mb": uss_peak},
         }
         return False
 
     async def _wait_for_health(self, timeout: float) -> bool:
-        """
-        Wait for server to respond to health checks.
-
-        Note: start() now implements a richer loop for profiling.
-        This method is still used by callers (e.g., adapters).
-        """
         await self._ensure_session()
         start_time = time.time()
 
@@ -424,7 +416,6 @@ class LlamaServerManager:
         return False
 
     async def check_health(self) -> bool:
-        """Check if server is healthy."""
         if not self.is_running:
             return False
 
@@ -443,7 +434,6 @@ class LlamaServerManager:
             return False
 
     async def stop(self):
-        """Stop llama-server process gracefully."""
         if not self.is_running:
             logger.info("Server is not running")
             await self._close_session()
@@ -472,16 +462,12 @@ class LlamaServerManager:
             await self._close_session()
 
     async def restart(self) -> bool:
-        """Restart server."""
         logger.info("Restarting server...")
         await self.stop()
         await asyncio.sleep(1)
         return await self.start()
 
     async def get_server_info(self) -> Optional[Dict[str, Any]]:
-        """
-        Get server information and stats.
-        """
         if not await self.check_health():
             return None
 
@@ -521,9 +507,6 @@ async def start_server(
     n_gpu_layers: int = 0,
     **kwargs,
 ) -> LlamaServerManager:
-    """
-    Convenience function to start a server with minimal config.
-    """
     config = ServerConfig(
         model_path=model_path,
         host=host,
